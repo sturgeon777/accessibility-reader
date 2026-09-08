@@ -11,13 +11,45 @@ function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-chrome.runtime.onInstalled.addListener(() => {
+const INJECTABLE_URL = /^(https?|file):/;
+
+// 확장 프로그램을 다시 불러오면 이미 열려 있던 탭의 콘텐트 스크립트는 죽지만
+// 새 스크립트가 자동으로 들어가지는 않는다. 그래서 열린 탭에 직접 다시 주입한다.
+// 이것이 없으면 수정할 때마다 모든 탭을 새로고침해야 한다.
+async function reinjectOpenTabs() {
+  let tabs = [];
+  try {
+    tabs = await chrome.tabs.query({});
+  } catch (err) {
+    console.warn('[acc-reader] 탭 목록 조회 실패:', err);
+    return;
+  }
+
+  const results = await Promise.all(tabs.map(async (tab) => {
+    if (!tab.id || !INJECTABLE_URL.test(tab.url || '')) return false;
+    try {
+      await chrome.scripting.executeScript({ target: { tabId: tab.id }, files: ['content.js'] });
+      return true;
+    } catch (err) {
+      // 크롬 웹스토어처럼 주입이 금지된 페이지는 건너뛴다.
+      return false;
+    }
+  }));
+
+  console.log(`[acc-reader] 열린 탭 재주입: ${results.filter(Boolean).length}/${tabs.length}`);
+}
+
+chrome.runtime.onInstalled.addListener(async () => {
+  await chrome.contextMenus.removeAll();
   chrome.contextMenus.create({
     id: "transformSelectionMenu",
     title: "쉬운 글로 변환 (선택 영역)",
     contexts: ["selection"]
   });
+  reinjectOpenTabs();
 });
+
+chrome.runtime.onStartup.addListener(reinjectOpenTabs);
 
 chrome.contextMenus.onClicked.addListener(async (info, tab) => {
   if (info.menuItemId !== "transformSelectionMenu" || !tab || !tab.id) return;

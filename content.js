@@ -1,6 +1,28 @@
 (function () {
-  if (window.__accReaderInjected) return;
+  const ACC_IDS = ['acc-style', 'acc-reader-overlay', 'acc-float-btn'];
+
+  function removeAccNodes() {
+    ACC_IDS.forEach(id => {
+      const stale = document.getElementById(id);
+      if (stale) stale.remove();
+    });
+  }
+
+  // 확장 프로그램을 다시 불러오면 이전 콘텐트 스크립트가 페이지에 남는다.
+  // 새로 주입될 때 이전 흔적을 먼저 걷어내야 UI와 리스너가 중복되지 않는다.
+  if (typeof window.__accReaderCleanup === 'function') {
+    try {
+      window.__accReaderCleanup();
+    } catch (err) {
+      // 이전 컨텍스트가 이미 무효화된 경우. 아래에서 DOM만 정리한다.
+    }
+  }
+  removeAccNodes();
   window.__accReaderInjected = true;
+
+  // 이 인스턴스가 페이지에 붙인 리스너를 한 번에 떼어내기 위한 신호
+  const listenerScope = new AbortController();
+  const scoped = { signal: listenerScope.signal };
 
   let currentUtterance = null;
   let clickToReadEnabled = true;
@@ -183,6 +205,13 @@
       window.speechSynthesis.cancel();
     }
   }
+
+  // 다음 주입 때 이 인스턴스를 깨끗이 걷어낼 수 있도록 등록해 둔다.
+  window.__accReaderCleanup = () => {
+    listenerScope.abort();
+    stopTTS();
+    removeAccNodes();
+  };
 
   // 크롬은 긴 텍스트를 한 번에 넘기면 약 15초 뒤 무음으로 멈춘다.
   // 문장 단위로 잘라 순차 재생하면 이 제한에 걸리지 않는다.
@@ -393,7 +422,7 @@
       e.preventDefault();
       stopTTS();
     }
-  });
+  }, scoped);
 
   document.addEventListener('mouseup', (e) => {
     if (floatBtn.contains(e.target) || document.getElementById('acc-reader-overlay')?.contains(e.target)) {
@@ -411,13 +440,13 @@
     } else {
       floatBtn.style.display = 'none';
     }
-  });
+  }, scoped);
 
   document.addEventListener('mousedown', (e) => {
     if (!floatBtn.contains(e.target)) {
       floatBtn.style.display = 'none';
     }
-  });
+  }, scoped);
 
   floatBtn.addEventListener('click', () => {
     const text = floatBtn.dataset.selectedText;
