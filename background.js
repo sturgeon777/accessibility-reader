@@ -19,12 +19,20 @@ chrome.runtime.onInstalled.addListener(() => {
   });
 });
 
-chrome.contextMenus.onClicked.addListener((info, tab) => {
-  if (info.menuItemId === "transformSelectionMenu" && tab && tab.id) {
-    chrome.tabs.sendMessage(tab.id, {
-      action: "transformFromContextMenu",
-      text: info.selectionText
-    });
+chrome.contextMenus.onClicked.addListener(async (info, tab) => {
+  if (info.menuItemId !== "transformSelectionMenu" || !tab || !tab.id) return;
+
+  const message = { action: "transformFromContextMenu", text: info.selectionText };
+  try {
+    await chrome.tabs.sendMessage(tab.id, message);
+  } catch (err) {
+    // 콘텐트 스크립트가 없는 탭이면 주입한 뒤 다시 보낸다.
+    try {
+      await chrome.scripting.executeScript({ target: { tabId: tab.id }, files: ['content.js'] });
+      await chrome.tabs.sendMessage(tab.id, message);
+    } catch (injectErr) {
+      console.warn('[acc-reader] 콘텐트 스크립트 주입 실패:', injectErr);
+    }
   }
 });
 
