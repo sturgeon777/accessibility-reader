@@ -1,0 +1,10 @@
+# Windows / 편집기 부산물
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/
+
+# 패키징 산출물
+*.zip
+*.crx
+*.pem

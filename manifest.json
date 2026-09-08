@@ -1,0 +1,19 @@
+{
+  "manifest_version": 3,
+  "name": "쉬운 글 & 가독성 AI 리더",
+  "version": "2.2",
+  "description": "드래그 선택/우클릭 변환, Gemini AI 기반 쉬운 언어 변환, 전문용어 사전 및 클릭 위치 TTS 음성 읽기",
+  "permissions": ["activeTab", "scripting", "storage", "contextMenus"],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content.js"]
+    }
+  ],
+  "action": {
+    "default_popup": "popup.html"
+  }
+}
