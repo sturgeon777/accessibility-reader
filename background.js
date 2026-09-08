@@ -2,6 +2,15 @@ const API_BASE = 'https://generativelanguage.googleapis.com/v1beta';
 const MODEL_CANDIDATES = ['gemini-3.6-flash', 'gemini-2.5-flash', 'gemini-2.0-flash'];
 const MAX_INPUT_CHARS = 8000;
 
+// 서버 혼잡/일시 장애. 재시도하면 대개 풀린다.
+const TRANSIENT_STATUS = [429, 500, 502, 503, 504];
+// 총 3회 시도. 서비스 워커가 유휴 상태로 종료되지 않도록 대기 시간은 짧게 유지한다.
+const RETRY_DELAYS_MS = [1200, 3500];
+
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
 chrome.runtime.onInstalled.addListener(() => {
   chrome.contextMenus.create({
     id: "transformSelectionMenu",
@@ -49,6 +58,25 @@ async function callModel(model, apiKey, prompt) {
   });
   const json = await res.json().catch(() => ({}));
   return { res, json };
+}
+
+// 일시적 오류(혼잡/장애)면 같은 모델로 잠시 뒤 다시 시도한다.
+// 모델을 바꾸면 결과 품질이 달라지므로 여기서는 모델을 유지한다.
+async function callModelWithRetry(model, apiKey, prompt) {
+  let last = null;
+
+  for (let attempt = 0; attempt <= RETRY_DELAYS_MS.length; attempt++) {
+    last = await callModel(model, apiKey, prompt);
+    if (last.res.ok || !TRANSIENT_STATUS.includes(last.res.status)) {
+      return last;
+    }
+    if (attempt < RETRY_DELAYS_MS.length) {
+      console.warn(`[acc-reader] ${model} HTTP ${last.res.status} - ${RETRY_DELAYS_MS[attempt]}ms 후 재시도`);
+      await sleep(RETRY_DELAYS_MS[attempt]);
+    }
+  }
+
+  return last;
 }
 
 // 모델 이름이 틀렸을 때만 다음 후보로 넘어간다.
@@ -118,12 +146,19 @@ async function generate(prompt, apiKey) {
   let lastNotFound = null;
 
   for (const model of order) {
-    const { res, json } = await callModel(model, apiKey, prompt);
+    const { res, json } = await callModelWithRetry(model, apiKey, prompt);
 
     if (!res.ok) {
       if (isModelNotFound(res, json)) {
         lastNotFound = (json.error && json.error.message) || `HTTP ${res.status}`;
         continue;
+      }
+      if (TRANSIENT_STATUS.includes(res.status)) {
+        throw new Error(
+          `Gemini 서버가 일시적으로 혼잡합니다 (HTTP ${res.status}).
+` +
+          `${RETRY_DELAYS_MS.length + 1}회 시도했지만 실패했습니다. 잠시 후 다시 시도해 주세요.`
+        );
       }
       const detail = (json.error && json.error.message) || '(응답 본문 없음)';
       throw new Error(`API 오류 (HTTP ${res.status}): ${detail}`);
@@ -132,6 +167,7 @@ async function generate(prompt, apiKey) {
     if (model !== cached) {
       await chrome.storage.local.set({ geminiModel: model });
     }
+    console.log('[acc-reader] 사용 모델:', model);
     return extractText(json);
   }
 
