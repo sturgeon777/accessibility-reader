@@ -119,6 +119,22 @@
       line-height: 1.5;
     }
 
+    #acc-model-tag {
+      font-size: 0.72rem; color: #64748b; font-weight: 500;
+      margin-left: 8px; letter-spacing: 0.01em;
+    }
+
+    #acc-model-notice {
+      background: #eff6ff;
+      border: 1px solid #bfdbfe;
+      color: #1e40af;
+      font-size: 0.92rem;
+      padding: 9px 14px;
+      border-radius: 8px;
+      margin-bottom: 14px;
+      line-height: 1.5;
+    }
+
     #acc-reader-close-btn {
       position: absolute; top: 20px; right: 24px;
       background: #f3f4f6; border: none;
@@ -174,7 +190,7 @@
     <div id="acc-reader-modal">
       <button id="acc-reader-close-btn" title="닫기">✕</button>
       <div id="acc-reader-header">
-        <h3 id="acc-reader-modal-title">접근성 AI 리더 <span id="acc-reader-badge">전체 본문</span></h3>
+        <h3 id="acc-reader-modal-title">접근성 AI 리더 <span id="acc-reader-badge">전체 본문</span><span id="acc-model-tag"></span></h3>
       </div>
       
       <div id="acc-tts-toolbar">
@@ -324,6 +340,8 @@
     const toolbar = document.getElementById('acc-tts-toolbar');
 
     badge.innerText = isSelection ? '선택 분석 중' : '전체 분석 중';
+    const modelTag = document.getElementById('acc-model-tag');
+    if (modelTag) modelTag.innerText = '';
     if (toolbar) toolbar.style.display = 'none';
 
     contentArea.innerHTML = `
@@ -340,7 +358,7 @@
     overlay.style.display = 'flex';
   }
 
-  function renderOverlayContent(rawText, isSelection, truncatedFrom) {
+  function renderOverlayContent(rawText, isSelection, truncatedFrom, modelInfo) {
     stopTTS();
     const overlay = document.getElementById('acc-reader-overlay');
     const badge = document.getElementById('acc-reader-badge');
@@ -350,6 +368,17 @@
     if (toolbar) toolbar.style.display = 'flex';
     badge.innerText = isSelection ? '선택 문단' : '전체 본문';
     contentArea.innerHTML = '';
+
+    const modelTag = document.getElementById('acc-model-tag');
+    if (modelTag) modelTag.innerText = modelInfo && modelInfo.model ? modelInfo.model : '';
+
+    // 혼잡으로 다른 모델이 답한 경우, 조용히 바뀌지 않도록 알린다.
+    if (modelInfo && modelInfo.switchedForLoad) {
+      const switched = document.createElement('div');
+      switched.id = 'acc-model-notice';
+      switched.innerText = `평소 쓰는 모델이 혼잡하여 ${modelInfo.model} 모델로 변환했습니다. 결과가 평소와 조금 다를 수 있습니다.`;
+      contentArea.appendChild(switched);
+    }
 
     if (truncatedFrom) {
       const notice = document.createElement('div');
@@ -485,7 +514,10 @@
       return;
     }
 
-    renderOverlayContent(result.text, isSelection, result.truncatedFrom);
+    renderOverlayContent(result.text, isSelection, result.truncatedFrom, {
+      model: result.model,
+      switchedForLoad: result.switchedForLoad
+    });
   }
 
   chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {

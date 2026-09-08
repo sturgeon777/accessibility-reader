@@ -202,6 +202,9 @@ async function generate(prompt, apiKey) {
     : [...MODEL_CANDIDATES];
 
   let lastNotFound = null;
+  let lastTransient = null;
+  // 혼잡 때문에 넘어온 경우인지. 이때는 모델 선택을 영구 저장하지 않는다.
+  let switchedForLoad = false;
 
   for (const model of order) {
     const { res, json } = await callModelWithRetry(model, apiKey, prompt);
@@ -212,21 +215,32 @@ async function generate(prompt, apiKey) {
         continue;
       }
       if (TRANSIENT_STATUS.includes(res.status)) {
-        throw new Error(
-          `Gemini 서버가 일시적으로 혼잡합니다 (HTTP ${res.status}).
-` +
-          `${RETRY_DELAYS_MS.length + 1}회 시도했지만 실패했습니다. 잠시 후 다시 시도해 주세요.`
-        );
+        // 재시도까지 했는데도 붐빈다. 다른 모델로 넘어가 본다.
+        console.warn(`[acc-reader] ${model} 혼잡(HTTP ${res.status}) - 다음 모델 시도`);
+        lastTransient = `HTTP ${res.status}`;
+        switchedForLoad = true;
+        continue;
       }
       const detail = (json.error && json.error.message) || '(응답 본문 없음)';
       throw new Error(`API 오류 (HTTP ${res.status}): ${detail}`);
     }
 
-    if (model !== cached) {
+    // 원래 모델이 사라진 게 아니라 잠깐 붐빈 것뿐이므로, 혼잡으로 넘어온
+    // 모델은 기본값으로 저장하지 않는다. 다음 요청은 다시 1순위부터 시도한다.
+    if (!switchedForLoad && model !== cached) {
       await chrome.storage.local.set({ geminiModel: model });
     }
+
     console.log('[acc-reader] 사용 모델:', model);
-    return extractText(json);
+    return { text: extractText(json), model, switchedForLoad };
+  }
+
+  // 후보가 모두 실패했다면 실제로 쓸 수 있는 모델 목록을 뽑아 알려준다.
+  if (lastTransient && !lastNotFound) {
+    throw new Error(
+      `Gemini 서버가 혼잡합니다 (${lastTransient}).\n` +
+      `${order.length}개 모델을 모두 시도했지만 실패했습니다. 잠시 후 다시 시도해 주세요.`
+    );
   }
 
   // 후보가 모두 실패했다면 실제로 쓸 수 있는 모델 목록을 뽑아 알려준다.
@@ -236,7 +250,7 @@ async function generate(prompt, apiKey) {
     ? `\n\n이 API Key로 사용 가능한 모델:\n${usable.slice(0, 15).join('\n')}`
     : '';
   throw new Error(
-    `사용 가능한 모델을 찾지 못했습니다.\n시도한 모델: ${order.join(', ')}\n마지막 응답: ${lastNotFound || '알 수 없음'}${hint}`
+    `사용 가능한 모델을 찾지 못했습니다.\n시도한 모델: ${order.join(', ')}\n마지막 응답: ${lastNotFound || lastTransient || '알 수 없음'}${hint}`
   );
 }
 
@@ -261,7 +275,13 @@ async function handleTransform(sourceText) {
 
   try {
     const result = await generate(buildPrompt(used), apiKey);
-    return { ok: true, text: result, truncatedFrom };
+    return {
+      ok: true,
+      text: result.text,
+      truncatedFrom,
+      model: result.model,
+      switchedForLoad: result.switchedForLoad
+    };
   } catch (err) {
     console.error('[acc-reader]', err);
     return { ok: false, error: err.message || 'AI 변환 처리 중 오류가 발생했습니다.' };
