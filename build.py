@@ -7,6 +7,7 @@ files = {
   "version": "2.2",
   "description": "드래그 선택/우클릭 변환, Gemini AI 기반 쉬운 언어 변환, 전문용어 사전 및 클릭 위치 TTS 음성 읽기",
   "permissions": ["activeTab", "scripting", "storage", "contextMenus"],
+  "host_permissions": ["https://generativelanguage.googleapis.com/*"],
   "background": {
     "service_worker": "background.js"
   },
@@ -21,7 +22,11 @@ files = {
   }
 }""",
 
-    "background.js": """chrome.runtime.onInstalled.addListener(() => {
+    "background.js": """const API_BASE = 'https://generativelanguage.googleapis.com/v1beta';
+const MODEL_CANDIDATES = ['gemini-3.6-flash', 'gemini-2.5-flash', 'gemini-2.0-flash'];
+const MAX_INPUT_CHARS = 8000;
+
+chrome.runtime.onInstalled.addListener(() => {
   chrome.contextMenus.create({
     id: "transformSelectionMenu",
     title: "쉬운 글로 변환 (선택 영역)",
@@ -35,6 +40,170 @@ chrome.contextMenus.onClicked.addListener((info, tab) => {
       action: "transformFromContextMenu",
       text: info.selectionText
     });
+  }
+});
+
+function buildPrompt(sourceText) {
+  return `당신은 웹 접근성 보조 전문 AI입니다. 아래 제공된 [원문]을 분석하여 다음 3가지 항목으로 구성된 쉬운 언어 보고서를 작성해 주세요.
+
+1. [3줄 핵심 요약]
+- 전체 내용의 핵심을 초등학생도 이해할 수 있는 쉬운 문장 3개로 요약합니다.
+
+2. [쉬운 말 변환 본문]
+- 어려운 한자어, 격식체, 복잡한 문장 구조, 법률/기술 전문 용어를 일상적인 쉬운 언어로 풀어 써 주세요.
+- 문장은 짧게 나누고 가독성이 뛰어나게 작성합니다.
+
+3. [어려운 용어 사전]
+- 원문에 포함된 어려운 단어, 한자어, 전문 용어를 3~5개 선별하고 각 단어의 쉬운 뜻풀이를 작성해 주세요.
+- 형식 예시:
+  • 단어명: 쉬운 뜻풀이 설명
+
+---
+[원문]:
+${sourceText}`;
+}
+
+async function callModel(model, apiKey, prompt) {
+  const res = await fetch(`${API_BASE}/models/${model}:generateContent?key=${encodeURIComponent(apiKey)}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      contents: [{ parts: [{ text: prompt }] }]
+    })
+  });
+  const json = await res.json().catch(() => ({}));
+  return { res, json };
+}
+
+// 모델 이름이 틀렸을 때만 다음 후보로 넘어간다.
+// 인증 실패(401/403), 할당량 초과(429), 서버 오류(5xx)는 모델과 무관하므로 그대로 보고한다.
+function isModelNotFound(res, json) {
+  if (res.status === 404) return true;
+  const message = (json && json.error && json.error.message) || '';
+  const status = (json && json.error && json.error.status) || '';
+  return status === 'NOT_FOUND' || /is not found|not supported|unsupported/i.test(message);
+}
+
+async function listUsableModels(apiKey) {
+  try {
+    const res = await fetch(`${API_BASE}/models?key=${encodeURIComponent(apiKey)}`);
+    const json = await res.json();
+    return (json.models || [])
+      .filter(m => (m.supportedGenerationMethods || []).includes('generateContent'))
+      .map(m => (m.name || '').replace('models/', ''))
+      .filter(Boolean);
+  } catch (err) {
+    return [];
+  }
+}
+
+function extractText(json) {
+  if (json.promptFeedback && json.promptFeedback.blockReason) {
+    throw new Error(`원문이 안전 필터에 의해 차단되었습니다. (사유: ${json.promptFeedback.blockReason})`);
+  }
+
+  const candidate = json.candidates && json.candidates[0];
+  if (!candidate) {
+    throw new Error('AI가 응답을 생성하지 못했습니다. 다른 문단으로 다시 시도해 주세요.');
+  }
+
+  const text = candidate.content
+    && candidate.content.parts
+    && candidate.content.parts[0]
+    && candidate.content.parts[0].text;
+
+  if (!text) {
+    const reason = candidate.finishReason;
+    if (reason === 'SAFETY') {
+      throw new Error('응답이 안전 필터에 의해 차단되었습니다. 다른 문단으로 시도해 주세요.');
+    }
+    if (reason === 'RECITATION') {
+      throw new Error('저작권 보호 정책에 의해 응답이 차단되었습니다. 다른 문단으로 시도해 주세요.');
+    }
+    if (reason === 'MAX_TOKENS') {
+      throw new Error('원문이 너무 길어 응답이 잘렸습니다. 더 짧은 범위를 선택해 주세요.');
+    }
+    throw new Error('AI가 빈 응답을 반환했습니다. 잠시 후 다시 시도해 주세요.');
+  }
+
+  if (candidate.finishReason === 'MAX_TOKENS') {
+    return `${text}\\n\\n(안내: 응답이 길이 제한에 걸려 도중에 끊겼습니다.)`;
+  }
+  return text;
+}
+
+// 성공한 모델 id를 저장해 두었다가 다음 요청에서 먼저 시도한다.
+async function generate(prompt, apiKey) {
+  const cached = (await chrome.storage.local.get('geminiModel')).geminiModel;
+  const order = cached
+    ? [cached, ...MODEL_CANDIDATES.filter(m => m !== cached)]
+    : [...MODEL_CANDIDATES];
+
+  let lastNotFound = null;
+
+  for (const model of order) {
+    const { res, json } = await callModel(model, apiKey, prompt);
+
+    if (!res.ok) {
+      if (isModelNotFound(res, json)) {
+        lastNotFound = (json.error && json.error.message) || `HTTP ${res.status}`;
+        continue;
+      }
+      const detail = (json.error && json.error.message) || '(응답 본문 없음)';
+      throw new Error(`API 오류 (HTTP ${res.status}): ${detail}`);
+    }
+
+    if (model !== cached) {
+      await chrome.storage.local.set({ geminiModel: model });
+    }
+    return extractText(json);
+  }
+
+  // 후보가 모두 실패했다면 실제로 쓸 수 있는 모델 목록을 뽑아 알려준다.
+  await chrome.storage.local.remove('geminiModel');
+  const usable = await listUsableModels(apiKey);
+  const hint = usable.length
+    ? `\\n\\n이 API Key로 사용 가능한 모델:\\n${usable.slice(0, 15).join('\\n')}`
+    : '';
+  throw new Error(
+    `사용 가능한 모델을 찾지 못했습니다.\\n시도한 모델: ${order.join(', ')}\\n마지막 응답: ${lastNotFound || '알 수 없음'}${hint}`
+  );
+}
+
+async function handleTransform(sourceText) {
+  const apiKey = (await chrome.storage.local.get('geminiApiKey')).geminiApiKey;
+  if (!apiKey) {
+    return {
+      ok: false,
+      error: 'Gemini API Key가 설정되지 않았습니다. 확장 프로그램 팝업 창에서 API Key를 입력 후 저장해 주세요.'
+    };
+  }
+
+  const text = (sourceText || '').trim();
+  if (!text) {
+    return { ok: false, error: '변환할 글을 찾지 못했습니다.' };
+  }
+
+  const used = text.slice(0, MAX_INPUT_CHARS);
+  const truncatedFrom = text.length > MAX_INPUT_CHARS
+    ? { used: used.length, total: text.length }
+    : null;
+
+  try {
+    const result = await generate(buildPrompt(used), apiKey);
+    return { ok: true, text: result, truncatedFrom };
+  } catch (err) {
+    console.error('[acc-reader]', err);
+    return { ok: false, error: err.message || 'AI 변환 처리 중 오류가 발생했습니다.' };
+  }
+}
+
+// 콘텐트 스크립트의 fetch는 페이지의 CSP(connect-src)를 따르기 때문에
+// CSP가 엄격한 사이트에서 차단된다. API 호출은 여기서 대신 수행한다.
+chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
+  if (request && request.action === 'callGemini') {
+    handleTransform(request.text).then(sendResponse);
+    return true;
   }
 });""",
 
@@ -192,6 +361,9 @@ function showStatus(msg) {
 
   let currentUtterance = null;
   let clickToReadEnabled = true;
+  let ttsSeq = 0;
+  let ttsWatchdog = null;
+  let requestSeq = 0;
 
   const style = document.createElement('style');
   style.id = 'acc-style';
@@ -271,6 +443,17 @@ function showStatus(msg) {
       background-color: #e0f2fe;
     }
 
+    #acc-truncate-notice {
+      background: #fffbeb;
+      border: 1px solid #fde68a;
+      color: #92400e;
+      font-size: 0.95rem;
+      padding: 10px 14px;
+      border-radius: 8px;
+      margin-bottom: 16px;
+      line-height: 1.5;
+    }
+
     #acc-reader-close-btn {
       position: absolute; top: 20px; right: 24px;
       background: #f3f4f6; border: none;
@@ -318,7 +501,7 @@ function showStatus(msg) {
       100% { transform: rotate(360deg); }
     }
   `;
-  document.head.appendChild(style);
+  (document.head || document.documentElement).appendChild(style);
 
   const overlayDiv = document.createElement('div');
   overlayDiv.id = 'acc-reader-overlay';
@@ -347,9 +530,44 @@ function showStatus(msg) {
   document.body.appendChild(floatBtn);
 
   function stopTTS() {
+    ttsSeq++;
+    if (ttsWatchdog) {
+      clearInterval(ttsWatchdog);
+      ttsWatchdog = null;
+    }
+    currentUtterance = null;
     if ('speechSynthesis' in window) {
       window.speechSynthesis.cancel();
     }
+  }
+
+  // 크롬은 긴 텍스트를 한 번에 넘기면 약 15초 뒤 무음으로 멈춘다.
+  // 문장 단위로 잘라 순차 재생하면 이 제한에 걸리지 않는다.
+  function splitIntoChunks(text) {
+    const MAX_CHUNK = 180;
+    const chunks = [];
+
+    text.split('\\n').forEach(line => {
+      const trimmedLine = line.trim();
+      if (!trimmedLine) return;
+
+      trimmedLine.split(/(?<=[.!?…])\\s+/).forEach(sentence => {
+        let rest = sentence.trim();
+        if (!rest) return;
+
+        // 문장 하나가 지나치게 길면 쉼표나 공백에서 한 번 더 나눈다.
+        while (rest.length > MAX_CHUNK) {
+          let cut = rest.lastIndexOf(',', MAX_CHUNK);
+          if (cut < MAX_CHUNK * 0.4) cut = rest.lastIndexOf(' ', MAX_CHUNK);
+          if (cut < MAX_CHUNK * 0.4) cut = MAX_CHUNK;
+          chunks.push(rest.slice(0, cut + 1).trim());
+          rest = rest.slice(cut + 1).trim();
+        }
+        if (rest) chunks.push(rest);
+      });
+    });
+
+    return chunks;
   }
 
   function playTTS(textToRead) {
@@ -362,14 +580,42 @@ function showStatus(msg) {
     if (!textToRead || !textToRead.trim()) return;
 
     const cleanText = textToRead.replace(/[#*`_~]/g, '');
-    currentUtterance = new SpeechSynthesisUtterance(cleanText);
-    currentUtterance.lang = 'ko-KR';
-    currentUtterance.rate = 0.95;
+    const chunks = splitIntoChunks(cleanText);
+    if (!chunks.length) return;
 
-    currentUtterance.onend = () => stopTTS();
-    currentUtterance.onerror = () => stopTTS();
+    // stopTTS()가 올린 값을 기준으로 삼는다. 이후 정지되면 세대가 어긋나 체인이 멈춘다.
+    const mySeq = ttsSeq;
+    let idx = 0;
 
-    window.speechSynthesis.speak(currentUtterance);
+    // 크롬이 재생 도중 스스로 일시정지 상태에 빠지는 경우가 있어 주기적으로 깨운다.
+    ttsWatchdog = setInterval(() => {
+      if (mySeq !== ttsSeq) return;
+      if (window.speechSynthesis.speaking && window.speechSynthesis.paused) {
+        window.speechSynthesis.resume();
+      }
+    }, 5000);
+
+    const speakNext = () => {
+      if (mySeq !== ttsSeq) return;
+      if (idx >= chunks.length) {
+        stopTTS();
+        return;
+      }
+
+      const utterance = new SpeechSynthesisUtterance(chunks[idx++]);
+      utterance.lang = 'ko-KR';
+      utterance.rate = 0.95;
+      utterance.onend = speakNext;
+      utterance.onerror = () => {
+        if (mySeq !== ttsSeq) return;
+        stopTTS();
+      };
+
+      currentUtterance = utterance;
+      window.speechSynthesis.speak(utterance);
+    };
+
+    speakNext();
   }
 
   function playAllText() {
@@ -422,7 +668,7 @@ function showStatus(msg) {
     overlay.style.display = 'flex';
   }
 
-  function renderOverlayContent(rawText, isSelection) {
+  function renderOverlayContent(rawText, isSelection, truncatedFrom) {
     stopTTS();
     const overlay = document.getElementById('acc-reader-overlay');
     const badge = document.getElementById('acc-reader-badge');
@@ -432,6 +678,13 @@ function showStatus(msg) {
     if (toolbar) toolbar.style.display = 'flex';
     badge.innerText = isSelection ? '선택 문단' : '전체 본문';
     contentArea.innerHTML = '';
+
+    if (truncatedFrom) {
+      const notice = document.createElement('div');
+      notice.id = 'acc-truncate-notice';
+      notice.innerText = `원문이 길어 앞부분 ${truncatedFrom.used}자만 변환했습니다. (전체 ${truncatedFrom.total}자)`;
+      contentArea.appendChild(notice);
+    }
 
     const lines = rawText.split('\\n');
     lines.forEach((line, idx) => {
@@ -469,6 +722,8 @@ function showStatus(msg) {
   });
 
   function closeModal() {
+    // 진행 중인 요청의 결과가 뒤늦게 도착해 모달을 되살리지 못하게 한다.
+    requestSeq++;
     stopTTS();
     document.getElementById('acc-reader-overlay').style.display = 'none';
   }
@@ -529,59 +784,36 @@ function showStatus(msg) {
     }
   });
 
+  // API 호출은 background에서 수행한다. 콘텐트 스크립트의 fetch는
+  // 페이지의 CSP(connect-src)를 따르기 때문에 엄격한 사이트에서 차단된다.
   async function runGeminiTransform(textToTransform, isSelection) {
-    const storageData = await chrome.storage.local.get('geminiApiKey');
-    const apiKey = storageData.geminiApiKey;
-    if (!apiKey) {
-      alert('Gemini API Key가 설정되지 않았습니다. 확장 프로그램 팝업 창에서 API Key를 입력 후 저장해 주세요.');
+    const mySeq = ++requestSeq;
+    showLoadingOverlay(isSelection);
+
+    let result;
+    try {
+      result = await chrome.runtime.sendMessage({
+        action: 'callGemini',
+        text: textToTransform
+      });
+    } catch (err) {
+      if (mySeq !== requestSeq) return;
+      closeModal();
+      console.error(err);
+      alert('확장 프로그램 백그라운드와 통신하지 못했습니다. chrome://extensions 에서 확장 프로그램을 새로고침한 뒤 다시 시도해 주세요.');
       return;
     }
 
-    showLoadingOverlay(isSelection);
+    // 로딩 중 모달을 닫았거나 새 요청이 시작되었으면 이 결과는 버린다.
+    if (mySeq !== requestSeq) return;
 
-    try {
-      const prompt = `당신은 웹 접근성 보조 전문 AI입니다. 아래 제공된 [원문]을 분석하여 다음 3가지 항목으로 구성된 쉬운 언어 보고서를 작성해 주세요.
-
-1. [3줄 핵심 요약]
-- 전체 내용의 핵심을 초등학생도 이해할 수 있는 쉬운 문장 3개로 요약합니다.
-
-2. [쉬운 말 변환 본문]
-- 어려운 한자어, 격식체, 복잡한 문장 구조, 법률/기술 전문 용어를 일상적인 쉬운 언어로 풀어 써 주세요.
-- 문장은 짧게 나누고 가독성이 뛰어나게 작성합니다.
-
-3. [어려운 용어 사전]
-- 원문에 포함된 어려운 단어, 한자어, 전문 용어를 3~5개 선별하고 각 단어의 쉬운 뜻풀이를 작성해 주세요.
-- 형식 예시:
-  • 단어명: 쉬운 뜻풀이 설명
-
----
-[원문]:
-${textToTransform.slice(0, 3500)}`;
-
-      const apiRes = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent?key=${apiKey}`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          contents: [{ parts: [{ text: prompt }] }]
-        })
-      });
-
-      const resJson = await apiRes.json();
-
-      if (resJson.error) {
-        closeModal();
-        alert(`API 오류: ${resJson.error.message}`);
-        return;
-      }
-
-      const aiResponse = resJson.candidates[0].content.parts[0].text;
-      renderOverlayContent(aiResponse, isSelection);
-
-    } catch (err) {
+    if (!result || !result.ok) {
       closeModal();
-      console.error(err);
-      alert('AI 변환 처리 중 오류가 발생했습니다.');
+      alert((result && result.error) || 'AI 변환 처리 중 오류가 발생했습니다.');
+      return;
     }
+
+    renderOverlayContent(result.text, isSelection, result.truncatedFrom);
   }
 
   chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
