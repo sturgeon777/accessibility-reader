@@ -170,10 +170,12 @@ async function callModelWithRetry(model, apiKey, prompt, deadline) {
     if (last.res.ok || !TRANSIENT_STATUS.includes(last.res.status)) {
       return last;
     }
-    if (attempt < RETRY_DELAYS_MS.length && Date.now() + RETRY_DELAYS_MS[attempt] < deadline) {
-      console.warn(`[acc-reader] ${model} HTTP ${last.res.status} - ${RETRY_DELAYS_MS[attempt]}ms 후 재시도`);
-      await sleep(RETRY_DELAYS_MS[attempt]);
-    }
+    if (attempt >= RETRY_DELAYS_MS.length) break;
+    // 남은 시간이 없으면 대기 없이 곧바로 다시 부르지 말고 여기서 끝낸다.
+    // 간격 없는 재호출은 특히 429(할당량)에서 상황을 악화시킨다.
+    if (Date.now() + RETRY_DELAYS_MS[attempt] >= deadline) break;
+    console.warn(`[acc-reader] ${model} HTTP ${last.res.status} - ${RETRY_DELAYS_MS[attempt]}ms 후 재시도`);
+    await sleep(RETRY_DELAYS_MS[attempt]);
   }
 
   return last;
@@ -197,6 +199,7 @@ async function listUsableModels(apiKey) {
       .map(m => (m.name || '').replace('models/', ''))
       .filter(Boolean);
   } catch (err) {
+    console.warn('[acc-reader] 모델 목록 조회 실패:', err);
     return [];
   }
 }
@@ -271,14 +274,23 @@ async function tryOneModel(model, apiKey, prompt, state, withRetry) {
 
   if (res.ok) return json;
 
+  const apiMessage = (json && json.error && json.error.message) || '';
+
   if (isModelNotFound(res, json)) {
-    state.lastNotFound = (json.error && json.error.message) || `HTTP ${res.status}`;
+    const reason = apiMessage || `HTTP ${res.status}`;
+    state.lastNotFound = reason;
+    // 저장해 둔 모델이 사라진 경우에만 캐시를 비운다.
+    if (model === state.cached) state.cachedModelMissing = true;
+    state.failures.push({ model, reason: `사용 불가 - ${reason}` });
+    console.warn(`[acc-reader] ${model} 사용 불가:`, reason);
     return null;
   }
   if (TRANSIENT_STATUS.includes(res.status)) {
-    console.warn(`[acc-reader] ${model} 혼잡(HTTP ${res.status}) - 다음 모델 시도`);
+    const reason = `HTTP ${res.status}${apiMessage ? ' - ' + apiMessage : ''}`;
     state.lastTransient = `HTTP ${res.status}`;
     state.switchedForLoad = true;
+    state.failures.push({ model, reason });
+    console.warn(`[acc-reader] ${model} 일시적 실패:`, reason);
     return null;
   }
   const detail = (json.error && json.error.message) || '(응답 본문 없음)';
@@ -292,15 +304,26 @@ async function generate(prompt, apiKey, deadline) {
     ? [cached, ...MODEL_CANDIDATES.filter(m => m !== cached)]
     : [...MODEL_CANDIDATES];
 
-  const state = { lastNotFound: null, lastTransient: null, switchedForLoad: false, timedOut: false, deadline };
+  const state = {
+    lastNotFound: null,
+    lastTransient: null,
+    switchedForLoad: false,
+    timedOut: false,
+    cachedModelMissing: false,
+    failures: [],
+    cached,
+    deadline
+  };
 
   const finish = async (json, model) => {
+    // 쓸 수 있는 응답인지 먼저 확인한 뒤에 저장한다.
+    const text = extractText(json);
     // 혼잡으로 넘어온 모델은 기본값으로 저장하지 않는다. 잠깐 붐빈 것뿐이므로.
     if (!state.switchedForLoad && model !== cached) {
       await chrome.storage.local.set({ geminiModel: model });
     }
     console.log('[acc-reader] 사용 모델:', model);
-    return { text: extractText(json), model, switchedForLoad: state.switchedForLoad };
+    return { text, model, switchedForLoad: state.switchedForLoad };
   };
 
   for (const model of primary) {
@@ -324,7 +347,11 @@ async function generate(prompt, apiKey, deadline) {
     }
   }
 
-  await chrome.storage.local.remove('geminiModel');
+  // 저장해 둔 모델이 실제로 사라졌을 때만 캐시를 비운다.
+  // 단순히 붐볐을 뿐인데 지우면 다음 요청이 또 처음부터 탐색하게 된다.
+  if (state.cachedModelMissing) {
+    await chrome.storage.local.remove('geminiModel');
+  }
 
   if (state.timedOut) {
     throw new Error(
@@ -340,12 +367,21 @@ async function generate(prompt, apiKey, deadline) {
     );
   }
 
-  const tried = [...primary, ...extra];
+  // 모델마다 무엇이 왜 실패했는지 그대로 보여준다.
+  // 사유가 하나로 뭉뚱그려지면 원인을 짚을 수 없다.
+  const detail = state.failures.length
+    ? state.failures
+        .map(f => `- ${f.model}: ${String(f.reason).slice(0, 160)}`)
+        .join('\n')
+    : '- (응답을 받지 못했습니다)';
+
   const hint = discovered.length
-    ? `\n\n이 API Key로 사용 가능한 모델:\n${discovered.slice(0, 15).join('\n')}`
-    : '';
+    ? `\n\n이 API Key로 사용 가능한 모델:\n${discovered.slice(0, 15).join(', ')}`
+    : `\n\n모델 목록도 가져오지 못했습니다. API Key와 인터넷 연결을 확인해 주세요.`;
+
   throw new Error(
-    `변환에 성공한 모델이 없습니다.\n시도한 모델: ${tried.join(', ')}\n마지막 응답: ${state.lastNotFound || state.lastTransient || '알 수 없음'}${hint}`
+    `변환에 성공한 모델이 없습니다.\n\n` +
+    `${detail}${hint}`
   );
 }
 
