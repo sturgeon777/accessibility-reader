@@ -29,6 +29,7 @@
   let ttsSeq = 0;
   let ttsWatchdog = null;
   let requestSeq = 0;
+  let glossary = new Map();
 
   const style = document.createElement('style');
   style.id = 'acc-style';
@@ -106,6 +107,29 @@
 
     .acc-read-block.clickable:hover {
       background-color: #e0f2fe;
+    }
+
+    .acc-term {
+      color: #1d4ed8;
+      border-bottom: 2px dotted #2563eb;
+      cursor: pointer;
+      padding: 0 1px;
+    }
+
+    .acc-term:hover { background-color: #dbeafe; }
+
+    #acc-term-popover {
+      position: absolute;
+      z-index: 10;
+      max-width: 320px;
+      background: #1e293b;
+      color: #f8fafc;
+      font-size: 0.95rem;
+      line-height: 1.55;
+      padding: 10px 14px;
+      border-radius: 8px;
+      box-shadow: 0 10px 24px rgba(0, 0, 0, 0.28);
+      word-break: keep-all;
     }
 
     #acc-truncate-notice {
@@ -308,7 +332,7 @@
 
   function playAllText() {
     const allBlocks = Array.from(document.querySelectorAll('.acc-read-block'));
-    const fullText = allBlocks.map(b => b.innerText).join('\n');
+    const fullText = allBlocks.map(b => b.dataset.text || b.innerText).join('\n');
     if (fullText.trim()) {
       playTTS(fullText);
     }
@@ -330,6 +354,76 @@
       }
       blocks.forEach(b => b.classList.remove('clickable'));
     }
+  }
+
+  // AI 응답의 '어려운 용어 사전' 부분에서 단어와 뜻을 뽑아낸다.
+  // 형식: '• 단어: 쉬운 뜻풀이'
+  function parseGlossary(lines) {
+    const map = new Map();
+    lines.forEach(raw => {
+      const line = raw.trim();
+      if (!line) return;
+      const body = line.replace(/^[•·*-]+/, '').trim();
+      const sep = body.search(/[:：]/);
+      if (sep < 1) return;
+      const word = body.slice(0, sep).trim();
+      const meaning = body.slice(sep + 1).trim();
+      if (word.length >= 2 && word.length <= 20 && meaning) map.set(word, meaning);
+    });
+    return map;
+  }
+
+  // 본문에서 사전에 있는 단어를 찾아 누를 수 있게 감싼다.
+  // innerHTML 대신 노드를 직접 만들어 붙인다. AI 응답을 그대로 HTML로
+  // 해석하면 안 되기 때문이다.
+  function appendWithTerms(block, text, terms) {
+    let buffer = '';
+    const flush = () => {
+      if (buffer) {
+        block.appendChild(document.createTextNode(buffer));
+        buffer = '';
+      }
+    };
+
+    let i = 0;
+    while (i < text.length) {
+      const hit = terms.find(word => text.startsWith(word, i));
+      if (hit) {
+        flush();
+        const span = document.createElement('span');
+        span.className = 'acc-term';
+        span.textContent = hit;
+        span.dataset.term = hit;
+        block.appendChild(span);
+        i += hit.length;
+      } else {
+        buffer += text[i];
+        i += 1;
+      }
+    }
+    flush();
+  }
+
+  function hideTermPopover() {
+    const old = document.getElementById('acc-term-popover');
+    if (old) old.remove();
+  }
+
+  function showTermPopover(termEl) {
+    hideTermPopover();
+    const meaning = glossary.get(termEl.dataset.term);
+    if (!meaning) return;
+
+    const modal = document.getElementById('acc-reader-modal');
+    const pop = document.createElement('div');
+    pop.id = 'acc-term-popover';
+    pop.innerText = `${termEl.dataset.term}: ${meaning}`;
+    modal.appendChild(pop);
+
+    const mr = modal.getBoundingClientRect();
+    const er = termEl.getBoundingClientRect();
+    pop.style.left = `${Math.max(8, er.left - mr.left)}px`;
+    pop.style.top = `${er.bottom - mr.top + modal.scrollTop + 6}px`;
   }
 
   function showLoadingOverlay(isSelection) {
@@ -365,6 +459,7 @@
     const contentArea = document.getElementById('acc-reader-content-area');
     const toolbar = document.getElementById('acc-tts-toolbar');
 
+    hideTermPopover();
     if (toolbar) toolbar.style.display = 'flex';
     badge.innerText = isSelection ? '선택 문단' : '전체 본문';
     contentArea.innerHTML = '';
@@ -388,11 +483,29 @@
     }
 
     const lines = rawText.split('\n');
+
+    // '어려운 용어 사전'이 시작되는 줄. 그 아래는 사전 자체이므로 용어 표시를 하지 않는다.
+    let glossaryStart = lines.findIndex(l => l.includes('용어 사전'));
+    if (glossaryStart < 0) glossaryStart = lines.length;
+
+    glossary = parseGlossary(lines.slice(glossaryStart + 1));
+    // 긴 단어를 먼저 찾아야 짧은 단어에 가려지지 않는다.
+    const terms = [...glossary.keys()].sort((a, b) => b.length - a.length);
+
     lines.forEach((line, idx) => {
       const block = document.createElement('div');
       block.className = 'acc-read-block';
       block.dataset.index = idx;
-      block.innerText = line.length === 0 ? ' ' : line;
+      // 음성으로 읽을 원문. 화면에는 뜻풀이가 끼어들 수 있으므로 따로 보관한다.
+      block.dataset.text = line;
+
+      if (line.length === 0) {
+        block.innerText = ' ';
+      } else if (idx < glossaryStart && terms.length) {
+        appendWithTerms(block, line, terms);
+      } else {
+        block.innerText = line;
+      }
       contentArea.appendChild(block);
     });
 
@@ -410,19 +523,29 @@
   document.getElementById('acc-tts-stop').addEventListener('click', stopTTS);
 
   document.getElementById('acc-reader-content-area').addEventListener('click', (e) => {
+    const termEl = e.target.closest('.acc-term');
+    if (termEl) {
+      // 뜻만 띄우고 음성 재생으로 넘어가지 않게 막는다.
+      e.stopPropagation();
+      showTermPopover(termEl);
+      return;
+    }
+    hideTermPopover();
+
     if (!clickToReadEnabled) return;
     const targetBlock = e.target.closest('.acc-read-block');
     if (!targetBlock) return;
 
     const targetIdx = parseInt(targetBlock.dataset.index, 10);
     const allBlocks = Array.from(document.querySelectorAll('.acc-read-block'));
-    const textParts = allBlocks.slice(targetIdx).map(b => b.innerText);
+    const textParts = allBlocks.slice(targetIdx).map(b => b.dataset.text || b.innerText);
     const textToRead = textParts.join('\n');
     
     playTTS(textToRead);
   });
 
   function closeModal() {
+    hideTermPopover();
     // 진행 중인 요청의 결과가 뒤늦게 도착해 모달을 되살리지 못하게 한다.
     requestSeq++;
     stopTTS();
