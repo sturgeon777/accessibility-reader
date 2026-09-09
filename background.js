@@ -1,5 +1,8 @@
 const API_BASE = 'https://generativelanguage.googleapis.com/v1beta';
-const MODEL_CANDIDATES = ['gemini-3.6-flash', 'gemini-2.5-flash', 'gemini-2.0-flash'];
+// 1순위 후보. 여기서 모두 실패하면 API에 실제 사용 가능한 목록을 물어본다.
+const MODEL_CANDIDATES = ['gemini-3.6-flash', 'gemini-2.5-flash'];
+// 목록에서 추가로 시도해 볼 모델 수. 너무 많으면 사용자가 오래 기다린다.
+const MAX_DISCOVERED_TRIES = 4;
 const MAX_INPUT_CHARS = 8000;
 
 // 서버 혼잡/일시 장애. 재시도하면 대개 풀린다.
@@ -194,63 +197,104 @@ function extractText(json) {
   return text;
 }
 
+// 텍스트 변환에 쓸 수 없는 모델을 걸러내고 우선순위를 매긴다. 점수가 낮을수록 먼저 시도한다.
+function rankModel(name) {
+  if (/embedding|aqa|imagen|veo|tts|audio|image|vision|live/i.test(name)) return null;
+  let score = 0;
+  if (/flash/i.test(name)) score -= 30;
+  else if (/pro/i.test(name)) score -= 10;
+  if (/lite/i.test(name)) score += 5;
+  if (/preview|exp|thinking/i.test(name)) score += 20;
+  if (/gemma|learnlm/i.test(name)) score += 15;
+  return score;
+}
+
+function pickExtraModels(discovered, alreadyTried, limit) {
+  return discovered
+    .filter(name => !alreadyTried.has(name))
+    .map(name => ({ name, score: rankModel(name) }))
+    .filter(entry => entry.score !== null)
+    .sort((a, b) => a.score - b.score)
+    .slice(0, limit)
+    .map(entry => entry.name);
+}
+
+// 성공하면 응답을, 실패하면 null을 돌려주고 실패 사유를 state에 남긴다.
+async function tryOneModel(model, apiKey, prompt, state, withRetry) {
+  const { res, json } = withRetry
+    ? await callModelWithRetry(model, apiKey, prompt)
+    : await callModel(model, apiKey, prompt);
+
+  if (res.ok) return json;
+
+  if (isModelNotFound(res, json)) {
+    state.lastNotFound = (json.error && json.error.message) || `HTTP ${res.status}`;
+    return null;
+  }
+  if (TRANSIENT_STATUS.includes(res.status)) {
+    console.warn(`[acc-reader] ${model} 혼잡(HTTP ${res.status}) - 다음 모델 시도`);
+    state.lastTransient = `HTTP ${res.status}`;
+    state.switchedForLoad = true;
+    return null;
+  }
+  const detail = (json.error && json.error.message) || '(응답 본문 없음)';
+  throw new Error(`API 오류 (HTTP ${res.status}): ${detail}`);
+}
+
 // 성공한 모델 id를 저장해 두었다가 다음 요청에서 먼저 시도한다.
 async function generate(prompt, apiKey) {
   const cached = (await chrome.storage.local.get('geminiModel')).geminiModel;
-  const order = cached
+  const primary = cached
     ? [cached, ...MODEL_CANDIDATES.filter(m => m !== cached)]
     : [...MODEL_CANDIDATES];
 
-  let lastNotFound = null;
-  let lastTransient = null;
-  // 혼잡 때문에 넘어온 경우인지. 이때는 모델 선택을 영구 저장하지 않는다.
-  let switchedForLoad = false;
+  const state = { lastNotFound: null, lastTransient: null, switchedForLoad: false };
 
-  for (const model of order) {
-    const { res, json } = await callModelWithRetry(model, apiKey, prompt);
-
-    if (!res.ok) {
-      if (isModelNotFound(res, json)) {
-        lastNotFound = (json.error && json.error.message) || `HTTP ${res.status}`;
-        continue;
-      }
-      if (TRANSIENT_STATUS.includes(res.status)) {
-        // 재시도까지 했는데도 붐빈다. 다른 모델로 넘어가 본다.
-        console.warn(`[acc-reader] ${model} 혼잡(HTTP ${res.status}) - 다음 모델 시도`);
-        lastTransient = `HTTP ${res.status}`;
-        switchedForLoad = true;
-        continue;
-      }
-      const detail = (json.error && json.error.message) || '(응답 본문 없음)';
-      throw new Error(`API 오류 (HTTP ${res.status}): ${detail}`);
-    }
-
-    // 원래 모델이 사라진 게 아니라 잠깐 붐빈 것뿐이므로, 혼잡으로 넘어온
-    // 모델은 기본값으로 저장하지 않는다. 다음 요청은 다시 1순위부터 시도한다.
-    if (!switchedForLoad && model !== cached) {
+  const finish = async (json, model) => {
+    // 혼잡으로 넘어온 모델은 기본값으로 저장하지 않는다. 잠깐 붐빈 것뿐이므로.
+    if (!state.switchedForLoad && model !== cached) {
       await chrome.storage.local.set({ geminiModel: model });
     }
-
     console.log('[acc-reader] 사용 모델:', model);
-    return { text: extractText(json), model, switchedForLoad };
+    return { text: extractText(json), model, switchedForLoad: state.switchedForLoad };
+  };
+
+  for (const model of primary) {
+    const json = await tryOneModel(model, apiKey, prompt, state, true);
+    if (json) return finish(json, model);
   }
 
-  // 후보가 모두 실패했다면 실제로 쓸 수 있는 모델 목록을 뽑아 알려준다.
-  if (lastTransient && !lastNotFound) {
+  // 모델은 시간이 지나면 폐기된다. 하드코딩한 후보가 모두 실패하면
+  // API에 실제 사용 가능한 목록을 물어보고 그중에서 이어서 시도한다.
+  const discovered = await listUsableModels(apiKey);
+  const extra = pickExtraModels(discovered, new Set(primary), MAX_DISCOVERED_TRIES);
+
+  if (extra.length) {
+    console.log('[acc-reader] 목록에서 추가 시도:', extra.join(', '));
+    // 여기서 switchedForLoad를 켜지 않는다. 폐기된 모델 때문에 넘어온 경우에는
+    // 새로 찾은 모델을 기본값으로 저장해야 다음 요청에서 헛걸음하지 않는다.
+    for (const model of extra) {
+      // 이미 시간을 많이 썼으므로 여기서는 재시도 없이 한 번씩만 빠르게 훑는다.
+      const json = await tryOneModel(model, apiKey, prompt, state, false);
+      if (json) return finish(json, model);
+    }
+  }
+
+  await chrome.storage.local.remove('geminiModel');
+
+  if (state.lastTransient && !state.lastNotFound) {
     throw new Error(
-      `Gemini 서버가 혼잡합니다 (${lastTransient}).\n` +
-      `${order.length}개 모델을 모두 시도했지만 실패했습니다. 잠시 후 다시 시도해 주세요.`
+      `Gemini 서버가 혼잡합니다 (${state.lastTransient}).\n` +
+      `시도할 수 있는 모델을 모두 시도했지만 실패했습니다. 잠시 후 다시 시도해 주세요.`
     );
   }
 
-  // 후보가 모두 실패했다면 실제로 쓸 수 있는 모델 목록을 뽑아 알려준다.
-  await chrome.storage.local.remove('geminiModel');
-  const usable = await listUsableModels(apiKey);
-  const hint = usable.length
-    ? `\n\n이 API Key로 사용 가능한 모델:\n${usable.slice(0, 15).join('\n')}`
+  const tried = [...primary, ...extra];
+  const hint = discovered.length
+    ? `\n\n이 API Key로 사용 가능한 모델:\n${discovered.slice(0, 15).join('\n')}`
     : '';
   throw new Error(
-    `사용 가능한 모델을 찾지 못했습니다.\n시도한 모델: ${order.join(', ')}\n마지막 응답: ${lastNotFound || lastTransient || '알 수 없음'}${hint}`
+    `변환에 성공한 모델이 없습니다.\n시도한 모델: ${tried.join(', ')}\n마지막 응답: ${state.lastNotFound || state.lastTransient || '알 수 없음'}${hint}`
   );
 }
 
