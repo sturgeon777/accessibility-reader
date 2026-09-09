@@ -98,11 +98,19 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
 });
 
 function buildPrompt(sourceText) {
-  // 독일 Deutschlandfunk의 쉬운 언어 뉴스 Nachrichtenleicht가 따르는
-  // 'Leichte Sprache' 규칙을 한국어에 맞게 옮긴 것.
-  // 독일어 전용 규칙(복합어 하이픈 분리, 속격/접속법 회피)은 제외했다.
-  return `당신은 '쉬운 언어'(Leichte Sprache) 원칙에 따라 글을 다시 쓰는 전문가입니다.
-독일 공영방송의 쉬운 언어 뉴스처럼, 아래 [원문]을 누구나 읽을 수 있는 글로 바꾸어 주세요.
+  // 아래 규칙의 출처는 독일의 'Leichte Sprache'(쉬운 언어) 규칙집이다.
+  // (Netzwerk Leichte Sprache, 2006년 설립 / 2022 개정판)
+  //
+  // 이 확장의 착안 계기인 Deutschlandfunk의 Nachrichtenleicht는 한 단계 덜
+  // 단순화된 'Einfache Sprache'(간단한 언어)로 기사를 쓴다. 표현의 폭을 조금
+  // 더 확보하려고 의도적으로 택한 것이다. 다만 Einfache Sprache는 명확한
+  // 규칙집 없이 대략적인 지침만 있어, AI에게 줄 지시로는 규칙이 문서로
+  // 정리되어 있는 Leichte Sprache 쪽을 기준으로 삼았다.
+  //
+  // 독일어 전용 규칙(복합어 하이픈 분리, 속격/접속법 회피)은 한국어에
+  // 해당하지 않아 제외했다.
+  return `당신은 독일의 '쉬운 언어'(Leichte Sprache) 원칙에 따라 글을 다시 쓰는 전문가입니다.
+아래 [원문]을 누구나 읽을 수 있는 글로 바꾸어 주세요.
 
 [반드시 지킬 작성 규칙]
 - 한 문장에는 한 가지 내용만 담습니다.
