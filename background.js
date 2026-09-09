@@ -2,7 +2,9 @@ const API_BASE = 'https://generativelanguage.googleapis.com/v1beta';
 // 1순위 후보. 여기서 모두 실패하면 API에 실제 사용 가능한 목록을 물어본다.
 const MODEL_CANDIDATES = ['gemini-3.6-flash', 'gemini-2.5-flash'];
 // 목록에서 추가로 시도해 볼 모델 수. 너무 많으면 사용자가 오래 기다린다.
-const MAX_DISCOVERED_TRIES = 2;
+// 목록에는 폐기된 구버전이 남아 있기도 하므로 여유 있게 훑는다.
+// 이 단계는 재시도 없이 한 번씩만 부르고, 전체 시간 제한이 따로 있어 안전하다.
+const MAX_DISCOVERED_TRIES = 5;
 const MAX_INPUT_CHARS = 8000;
 
 // 서버 혼잡/일시 장애. 재시도하면 대개 풀린다.
@@ -247,6 +249,13 @@ function extractText(json) {
   return text;
 }
 
+// 이름에서 버전을 뽑는다. 'latest'는 구글이 최신 모델을 가리키는 별칭이므로 가장 높게 본다.
+function modelVersion(name) {
+  if (/latest/i.test(name)) return 99;
+  const m = name.match(/(\d+)\.(\d+)/);
+  return m ? Number(m[1]) + Number(m[2]) / 10 : 0;
+}
+
 // 텍스트 변환에 쓸 수 없는 모델을 걸러내고 우선순위를 매긴다. 점수가 낮을수록 먼저 시도한다.
 function rankModel(name) {
   if (/embedding|aqa|imagen|veo|tts|audio|image|vision|live/i.test(name)) return null;
@@ -262,9 +271,11 @@ function rankModel(name) {
 function pickExtraModels(discovered, alreadyTried, limit) {
   return discovered
     .filter(name => !alreadyTried.has(name))
-    .map(name => ({ name, score: rankModel(name) }))
+    .map(name => ({ name, score: rankModel(name), version: modelVersion(name) }))
     .filter(entry => entry.score !== null)
-    .sort((a, b) => a.score - b.score)
+    // 버전을 먼저 본다. 이름에 flash가 들어갔다는 이유로 폐기된 구버전이
+    // 앞자리를 차지하면, 정작 살아 있는 최신 모델까지 순서가 오지 않는다.
+    .sort((a, b) => (b.version - a.version) || (a.score - b.score))
     .slice(0, limit)
     .map(entry => entry.name);
 }
