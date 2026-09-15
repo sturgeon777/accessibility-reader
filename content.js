@@ -29,6 +29,7 @@
   let ttsSeq = 0;
   let ttsWatchdog = null;
   let requestSeq = 0;
+  let loadingHintTimer = null;
   let glossary = new Map();
 
   const style = document.createElement('style');
@@ -444,12 +445,19 @@
         <p style="margin-top: 20px; font-size: 1.15rem; color: #1e293b; font-weight: 700;">
           AI가 글을 쉬운 말로 분석 중입니다
         </p>
-        <p style="font-size: 0.9rem; color: #64748b; margin-top: 8px;">
+        <p id="acc-loading-sub" style="font-size: 0.9rem; color: #64748b; margin-top: 8px;">
           잠시만 기다려 주세요. 오른쪽 상단 ✕ 버튼을 누르면 취소됩니다.
         </p>
       </div>
     `;
     overlay.style.display = 'flex';
+
+    // 좋은 모델은 긴 글을 다시 쓰는 데 1분이 넘기도 한다. 멈춘 것으로 오해하지 않게 알린다.
+    clearTimeout(loadingHintTimer);
+    loadingHintTimer = setTimeout(() => {
+      const sub = document.getElementById('acc-loading-sub');
+      if (sub) sub.innerText = '긴 글은 쉽게 다시 쓰는 데 1~2분까지 걸릴 수 있습니다. 오른쪽 상단 ✕ 버튼을 누르면 취소됩니다.';
+    }, 15000);
   }
 
   function renderOverlayContent(rawText, isSelection, truncatedFrom, modelInfo) {
@@ -460,6 +468,7 @@
     const toolbar = document.getElementById('acc-tts-toolbar');
 
     hideTermPopover();
+    clearTimeout(loadingHintTimer);
     if (toolbar) toolbar.style.display = 'flex';
     badge.innerText = isSelection ? '선택 문단' : '전체 본문';
     contentArea.innerHTML = '';
@@ -549,6 +558,7 @@
 
   function closeModal() {
     hideTermPopover();
+    clearTimeout(loadingHintTimer);
     // 진행 중인 요청의 결과가 뒤늦게 도착해 모달을 되살리지 못하게 한다.
     requestSeq++;
     stopTTS();

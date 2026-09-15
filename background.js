@@ -13,10 +13,12 @@ const MAX_INPUT_CHARS = 8000;
 const TRANSIENT_STATUS = [429, 500, 502, 503, 504];
 // 모델당 2회 시도. 호출 하나가 수 초씩 걸리므로 재시도를 늘리면 전체가 너무 길어진다.
 const RETRY_DELAYS_MS = [1500];
-// 요청 하나에 쓸 수 있는 전체 시간. 넘으면 중단하고 사용자에게 알린다.
-const REQUEST_DEADLINE_MS = 70000;
-// 호출 하나가 응답 없이 매달려 예산을 다 먹는 것을 막는다.
-const SINGLE_CALL_TIMEOUT_MS = 30000;
+// 요청 하나에 쓸 수 있는 전체 시간. 긴 단락은 좋은 모델이 다시 쓰는 데 1분이 넘기도 한다.
+const REQUEST_DEADLINE_MS = 150000;
+// 첫 조각을 기다리는 시간. 모델이 먼저 생각하느라 첫 조각이 늦게 온다.
+const FIRST_CHUNK_TIMEOUT_MS = 60000;
+// 조각과 조각 사이가 이만큼 끊기면 멈춘 것으로 본다.
+const CHUNK_IDLE_TIMEOUT_MS = 20000;
 
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
@@ -153,11 +155,25 @@ function buildPrompt(sourceText) {
 ${sourceText}`;
 }
 
-async function callModel(model, apiKey, prompt) {
+// 응답을 조각조각(스트리밍) 받는다.
+//
+// 예전에는 완성본을 한 번에 기다리며 30초가 지나면 끊었다. 그런데 gemini-3.6-flash는
+// 긴 단락을 다시 쓰는 데 30초를 넘기곤 해서, 잘 쓰고 있던 요청까지 끊고 같은 모델로
+// 다시 부르다 전체 제한 시간을 다 썼다("시간 안에 변환을 마치지 못했습니다").
+// 이제 글이 들어오는 동안은 기다리고, 조각이 멈췄을 때만 끊는다.
+// 모든 대기 시간은 전체 마감 시각을 넘지 않게 잘라서 쓴다.
+async function callModel(model, apiKey, prompt, deadline) {
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), SINGLE_CALL_TIMEOUT_MS);
+  let timer = null;
+  const arm = (ms) => {
+    clearTimeout(timer);
+    const left = deadline - Date.now();
+    timer = setTimeout(() => controller.abort(), Math.max(0, Math.min(ms, left)));
+  };
+
   try {
-    const res = await fetch(`${API_BASE}/models/${model}:generateContent?key=${encodeURIComponent(apiKey)}`, {
+    arm(FIRST_CHUNK_TIMEOUT_MS);
+    const res = await fetch(`${API_BASE}/models/${model}:streamGenerateContent?alt=sse&key=${encodeURIComponent(apiKey)}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -165,12 +181,67 @@ async function callModel(model, apiKey, prompt) {
       }),
       signal: controller.signal
     });
-    const json = await res.json().catch(() => ({}));
-    return { res, json };
+
+    // 오류는 스트림이 아니라 일반 JSON으로 온다.
+    if (!res.ok) {
+      const json = await res.json().catch(() => ({}));
+      return { res, json };
+    }
+
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    let text = '';
+    let finishReason = null;
+    let promptFeedback = null;
+
+    const handleEvent = (payload) => {
+      let data;
+      try {
+        data = JSON.parse(payload);
+      } catch (err) {
+        return;
+      }
+      if (data.promptFeedback) promptFeedback = data.promptFeedback;
+      const candidate = data.candidates && data.candidates[0];
+      if (!candidate) return;
+      if (candidate.finishReason) finishReason = candidate.finishReason;
+      const parts = (candidate.content && candidate.content.parts) || [];
+      parts.forEach(part => {
+        // 모델이 생각한 과정은 결과에 넣지 않는다.
+        if (part.text && !part.thought) text += part.text;
+      });
+    };
+
+    const handleLine = (raw) => {
+      const line = raw.replace(/\r$/, '');
+      if (line.startsWith('data:')) handleEvent(line.slice(5).trim());
+    };
+
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      arm(CHUNK_IDLE_TIMEOUT_MS);
+      buffer += decoder.decode(value, { stream: true });
+      let newline;
+      while ((newline = buffer.indexOf('\n')) >= 0) {
+        handleLine(buffer.slice(0, newline));
+        buffer = buffer.slice(newline + 1);
+      }
+    }
+    buffer += decoder.decode();
+    if (buffer) handleLine(buffer);
+
+    // 한 번에 받은 응답과 같은 모양으로 합쳐서 돌려준다. extractText가 그대로 읽는다.
+    const json = {
+      candidates: (text || finishReason) ? [{ content: { parts: [{ text }] }, finishReason }] : [],
+      promptFeedback
+    };
+    return { res: { ok: true, status: 200 }, json };
   } catch (err) {
     if (err.name === 'AbortError') {
       // 일시적 오류와 같게 다루어 다음 후보로 넘어가게 한다.
-      return { res: { ok: false, status: 504 }, json: { error: { message: '응답 시간 초과' } } };
+      return { res: { ok: false, status: 504 }, json: { error: { message: '응답 시간 초과' }, timedOut: true } };
     }
     throw err;
   } finally {
@@ -184,10 +255,12 @@ async function callModelWithRetry(model, apiKey, prompt, deadline) {
   let last = null;
 
   for (let attempt = 0; attempt <= RETRY_DELAYS_MS.length; attempt++) {
-    last = await callModel(model, apiKey, prompt);
+    last = await callModel(model, apiKey, prompt, deadline);
     if (last.res.ok || !TRANSIENT_STATUS.includes(last.res.status)) {
       return last;
     }
+    // 느려서 끊긴 모델은 다시 불러도 또 끊긴다. 재시도하지 않고 다음 모델로 넘긴다.
+    if (last.json && last.json.timedOut) return last;
     if (attempt >= RETRY_DELAYS_MS.length) break;
     // 남은 시간이 없으면 대기 없이 곧바로 다시 부르지 말고 여기서 끝낸다.
     // 간격 없는 재호출은 특히 429(할당량)에서 상황을 악화시킨다.
@@ -325,7 +398,7 @@ async function tryOneModel(model, apiKey, prompt, state, withRetry) {
 
   const { res, json } = withRetry
     ? await callModelWithRetry(model, apiKey, prompt, state.deadline)
-    : await callModel(model, apiKey, prompt);
+    : await callModel(model, apiKey, prompt, state.deadline);
 
   if (res.ok) return json;
 
