@@ -170,7 +170,17 @@ ${sourceText}`;
 // 모든 대기 시간은 전체 마감 시각을 넘지 않게 잘라서 쓴다.
 async function callModel(model, apiKey, prompt, deadline) {
   const controller = new AbortController();
+  const startedAt = Date.now();
+  const seconds = (ms) => Math.round(ms / 1000);
   let timer = null;
+  let firstChunkAt = 0;
+  let text = '';
+  let events = 0;
+  let textParts = 0;
+  let thoughtParts = 0;
+  let finishReason = null;
+  let promptFeedback = null;
+
   const arm = (ms) => {
     clearTimeout(timer);
     const left = deadline - Date.now();
@@ -197,9 +207,6 @@ async function callModel(model, apiKey, prompt, deadline) {
     const reader = res.body.getReader();
     const decoder = new TextDecoder();
     let buffer = '';
-    let text = '';
-    let finishReason = null;
-    let promptFeedback = null;
 
     const handleEvent = (payload) => {
       let data;
@@ -208,14 +215,21 @@ async function callModel(model, apiKey, prompt, deadline) {
       } catch (err) {
         return;
       }
+      events += 1;
       if (data.promptFeedback) promptFeedback = data.promptFeedback;
       const candidate = data.candidates && data.candidates[0];
       if (!candidate) return;
       if (candidate.finishReason) finishReason = candidate.finishReason;
       const parts = (candidate.content && candidate.content.parts) || [];
       parts.forEach(part => {
-        // 모델이 생각한 과정은 결과에 넣지 않는다.
-        if (part.text && !part.thought) text += part.text;
+        if (typeof part.text !== 'string') return;
+        // 모델이 생각한 과정은 결과에 넣지 않는다. 다만 몇 개였는지는 센다.
+        if (part.thought) {
+          thoughtParts += 1;
+          return;
+        }
+        textParts += 1;
+        text += part.text;
       });
     };
 
@@ -227,6 +241,7 @@ async function callModel(model, apiKey, prompt, deadline) {
     for (;;) {
       const { value, done } = await reader.read();
       if (done) break;
+      if (!firstChunkAt) firstChunkAt = Date.now();
       arm(CHUNK_IDLE_TIMEOUT_MS);
       buffer += decoder.decode(value, { stream: true });
       let newline;
@@ -242,16 +257,32 @@ async function callModel(model, apiKey, prompt, deadline) {
     // 표시 없이 스트림이 닫혔다면 도중에 끊긴 것이므로 사용자에게 알린다.
     if (text && !finishReason) finishReason = 'INCOMPLETE';
 
+    const meta = {
+      finishReason,
+      events,
+      textParts,
+      thoughtParts,
+      chars: text.length,
+      firstChunkSec: firstChunkAt ? seconds(firstChunkAt - startedAt) : null,
+      totalSec: seconds(Date.now() - startedAt)
+    };
+    console.log(`[acc-reader] ${model} 응답`, meta);
+
     // 한 번에 받은 응답과 같은 모양으로 합쳐서 돌려준다. extractText가 그대로 읽는다.
     const json = {
       candidates: (text || finishReason) ? [{ content: { parts: [{ text }] }, finishReason }] : [],
-      promptFeedback
+      promptFeedback,
+      meta
     };
     return { res: { ok: true, status: 200 }, json };
   } catch (err) {
     if (err.name === 'AbortError') {
-      // 일시적 오류와 같게 다루어 다음 후보로 넘어가게 한다.
-      return { res: { ok: false, status: 504 }, json: { error: { message: '응답 시간 초과' }, timedOut: true } };
+      // 첫 응답이 아예 안 왔는지, 쓰다가 멈췄는지 구분해 적는다. 대처가 다르기 때문이다.
+      const elapsed = seconds(Date.now() - startedAt);
+      const stage = firstChunkAt
+        ? `응답 도중 멈춤(${elapsed}초, ${text.length}자 받음)`
+        : `첫 응답 없음(${elapsed}초)`;
+      return { res: { ok: false, status: 504 }, json: { error: { message: stage }, timedOut: true } };
     }
     throw err;
   } finally {
@@ -366,7 +397,7 @@ function extractText(json) {
 
   if (!text) {
     const reason = candidate.finishReason;
-    if (reason === 'SAFETY') {
+    if (['SAFETY', 'PROHIBITED_CONTENT', 'BLOCKLIST', 'SPII'].includes(reason)) {
       throw new Error('응답이 안전 필터에 의해 차단되었습니다. 다른 문단으로 시도해 주세요.');
     }
     if (reason === 'RECITATION') {
@@ -455,7 +486,28 @@ async function tryOneModel(model, apiKey, prompt, state, withRetry) {
     ? await callModelWithRetry(model, apiKey, prompt, state.deadline)
     : await callModel(model, apiKey, prompt, state.deadline);
 
-  if (res.ok) return json;
+  if (res.ok) {
+    const candidate = json.candidates && json.candidates[0];
+    const parts = (candidate && candidate.content && candidate.content.parts) || [];
+    const hasText = parts.some(p => typeof p.text === 'string' && p.text.trim());
+    const blockReasons = ['SAFETY', 'RECITATION', 'MAX_TOKENS', 'PROHIBITED_CONTENT', 'BLOCKLIST', 'SPII'];
+    const blocked = (json.promptFeedback && json.promptFeedback.blockReason)
+      || (candidate && blockReasons.includes(candidate.finishReason));
+
+    // 글자 없이 끝난 응답은 차단이 아니라면 모델 쪽 문제일 수 있으므로 다음 모델로 넘어간다.
+    // 예전에는 여기서 곧바로 "빈 응답" 알림을 띄우고 포기했다.
+    if (!hasText && !blocked) {
+      const m = json.meta || {};
+      const ending = m.finishReason || (candidate && candidate.finishReason) || '없음';
+      const reason = `빈 응답(끝맺음 ${ending}, 글 조각 ${m.textParts || 0}개, 생각 조각 ${m.thoughtParts || 0}개)`;
+      state.lastTransient = 'EMPTY';
+      state.switchedForLoad = true;
+      state.failures.push({ model, reason });
+      console.warn(`[acc-reader] ${model} ${reason}`, json.meta);
+      return null;
+    }
+    return json;
+  }
 
   const apiMessage = (json && json.error && json.error.message) || '';
 
@@ -472,7 +524,7 @@ async function tryOneModel(model, apiKey, prompt, state, withRetry) {
   if (TRANSIENT_STATUS.includes(res.status)) {
     let reason;
     if (json && json.timedOut) {
-      reason = '응답 시간 초과';
+      reason = (json.error && json.error.message) || '응답 시간 초과';
     } else if (res.status === 429) {
       reason = '사용량 한도 초과(429)';
       // 다음 요청에서도 곧바로 건너뛰도록 기억한다.
@@ -575,36 +627,29 @@ async function generate(prompt, apiKey, deadline) {
   });
   await saveUnavailable();
 
+  // 모델마다 무엇이 왜 실패했는지 그대로 보여준다. 사유가 하나로 뭉뚱그려지면 원인을 짚을 수 없다.
+  const detail = state.failures.length
+    ? state.failures.map(f => `- ${f.model}: ${f.reason}`).join('\n')
+    : '- (응답을 받지 못했습니다)';
+
   if (state.timedOut) {
     throw new Error(
-      `시간 안에 변환을 마치지 못했습니다.\n` +
-      `Gemini 응답이 너무 느리거나 서버가 붐비는 상태입니다. 더 짧은 문단을 선택해 다시 시도해 보세요.`
+      `시간 안에 변환을 마치지 못했습니다.\n\n${detail}\n\n` +
+      `모델이 붐비거나 느린 상태입니다. 잠시 뒤 다시 시도하거나 더 짧은 문단으로 시도해 보세요.`
     );
   }
 
   if (state.lastTransient && !state.lastNotFound) {
     throw new Error(
-      `Gemini 서버가 혼잡합니다 (${state.lastTransient}).\n` +
-      `시도할 수 있는 모델을 모두 시도했지만 실패했습니다. 잠시 후 다시 시도해 주세요.`
+      `지금은 쓸 수 있는 모델이 모두 제대로 응답하지 못했습니다.\n\n${detail}\n\n잠시 후 다시 시도해 주세요.`
     );
   }
-
-  // 모델마다 무엇이 왜 실패했는지 그대로 보여준다.
-  // 사유가 하나로 뭉뚱그려지면 원인을 짚을 수 없다.
-  const detail = state.failures.length
-    ? state.failures
-        .map(f => `- ${f.model}: ${String(f.reason).slice(0, 160)}`)
-        .join('\n')
-    : '- (응답을 받지 못했습니다)';
 
   const hint = discovered.length
     ? `\n\n이 API Key로 사용 가능한 모델:\n${discovered.slice(0, 15).join(', ')}`
     : `\n\n모델 목록도 가져오지 못했습니다. API Key와 인터넷 연결을 확인해 주세요.`;
 
-  throw new Error(
-    `변환에 성공한 모델이 없습니다.\n\n` +
-    `${detail}${hint}`
-  );
+  throw new Error(`변환에 성공한 모델이 없습니다.\n\n${detail}${hint}`);
 }
 
 async function handleTransform(sourceText) {
