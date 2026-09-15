@@ -1,0 +1,106 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8">
+  <title>붙여넣어 쉬운 글로 변환</title>
+  <style>
+    body {
+      margin: 0;
+      background: #f9fafb;
+      color: #111827;
+      font-family: -apple-system, BlinkMacSystemFont, "Pretendard", "Apple SD Gothic Neo", "Segoe UI", sans-serif;
+    }
+    main {
+      max-width: 820px;
+      margin: 0 auto;
+      padding: 40px 24px;
+    }
+    h1 {
+      font-size: 1.4rem;
+      margin: 0 0 6px;
+    }
+    .lead {
+      color: #4b5563;
+      font-size: 0.95rem;
+      margin: 0 0 20px;
+      line-height: 1.6;
+    }
+    textarea {
+      width: 100%;
+      min-height: 280px;
+      padding: 14px 16px;
+      box-sizing: border-box;
+      border: 1px solid #d1d5db;
+      border-radius: 10px;
+      font-size: 1rem;
+      font-family: inherit;
+      line-height: 1.7;
+      resize: vertical;
+      outline: none;
+      background: #ffffff;
+    }
+    textarea:focus {
+      border-color: #2563eb;
+    }
+    .row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      margin-top: 12px;
+    }
+    #count {
+      font-size: 0.85rem;
+      color: #6b7280;
+    }
+    #count.over {
+      color: #b45309;
+      font-weight: bold;
+    }
+    button {
+      background: #2563eb;
+      color: #ffffff;
+      border: none;
+      border-radius: 8px;
+      padding: 11px 20px;
+      font-size: 0.95rem;
+      font-weight: bold;
+      cursor: pointer;
+    }
+    button:hover {
+      background: #1d4ed8;
+    }
+    .tip {
+      margin-top: 24px;
+      font-size: 0.85rem;
+      color: #6b7280;
+      line-height: 1.6;
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>붙여넣어 쉬운 글로 변환</h1>
+    <p class="lead">
+      PDF로 된 논문처럼 드래그 버튼이 뜨지 않는 글은 여기에 붙여넣어 변환하세요.
+      요약하지 않고, 내용을 줄이지 않은 채 쉬운 말로 바꿉니다.
+    </p>
+
+    <textarea id="source" placeholder="논문의 한 단락을 복사해 붙여넣으세요"></textarea>
+
+    <div class="row">
+      <span id="count">0 / 8000자</span>
+      <button id="convert">쉬운 글로 변환 (Ctrl+Enter)</button>
+    </div>
+
+    <p class="tip">
+      · 한 번에 한 단락이나 한 절씩 넣는 것이 가장 잘 됩니다.<br>
+      · 밑줄 친 용어를 누르면 뜻이 뜨고, 문장을 누르면 그 자리부터 읽어 줍니다.<br>
+      · 변환 결과를 닫으면 이 화면으로 돌아와 다시 변환할 수 있습니다.
+    </p>
+  </main>
+
+  <script src="content.js"></script>
+  <script src="reader.js"></script>
+</body>
+</html>

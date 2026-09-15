@@ -643,6 +643,11 @@
     });
   }
 
+  // 붙여넣기 페이지(reader.html)에서 변환을 시작하는 입구.
+  // 일반 웹페이지에서는 콘텐트 스크립트가 격리된 공간에서 돌기 때문에
+  // 페이지의 스크립트가 이 함수에 접근할 수 없다.
+  window.__accReaderTransform = (text) => runGeminiTransform(text, true);
+
   chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     if (request.action === "transformFromContextMenu") {
       if (request.text) {

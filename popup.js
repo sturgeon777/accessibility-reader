@@ -67,6 +67,38 @@ document.getElementById('transformBtn').addEventListener('click', async () => {
   }
 });
 
+// 크롬에 내장된 PDF 뷰어 안에서는 콘텐트 스크립트가 돌지 않는다.
+// 그래서 붙여넣은 글은 확장 프로그램 전용 페이지를 새 탭으로 열어 거기서 변환한다.
+const PASTE_LIMIT = 8000;
+const pasteArea = document.getElementById('pasteText');
+const pasteCount = document.getElementById('pasteCount');
+
+pasteArea.addEventListener('input', () => {
+  const length = pasteArea.value.trim().length;
+  pasteCount.innerText = `${length} / ${PASTE_LIMIT}자`;
+  pasteCount.classList.toggle('over', length > PASTE_LIMIT);
+});
+
+document.getElementById('pasteBtn').addEventListener('click', async () => {
+  const text = pasteArea.value.trim();
+  if (!text) {
+    showStatus('변환할 글을 붙여넣어 주세요.');
+    return;
+  }
+
+  const keyInput = document.getElementById('apiKey').value.trim();
+  if (!keyInput) {
+    alert('Gemini API Key를 먼저 입력하고 저장해주세요.');
+    return;
+  }
+
+  // 팝업은 새 탭이 열리는 순간 닫히므로, 글을 먼저 저장해 두고 새 탭에서 꺼내 쓴다.
+  const store = chrome.storage.session || chrome.storage.local;
+  await store.set({ pendingPasteText: text });
+  await chrome.tabs.create({ url: chrome.runtime.getURL('reader.html') });
+  window.close();
+});
+
 function showStatus(msg) {
   document.getElementById('status').innerText = msg;
 }
