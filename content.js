@@ -470,11 +470,11 @@
       modelTag.innerText = parts.filter(Boolean).join(' · ');
     }
 
-    // 혼잡으로 다른 모델이 답한 경우, 조용히 바뀌지 않도록 알린다.
-    if (modelInfo && modelInfo.switchedForLoad) {
+    // 기본 모델이 아닌 모델이 답한 경우, 조용히 바뀌지 않도록 이유와 함께 알린다.
+    if (modelInfo && modelInfo.notice) {
       const switched = document.createElement('div');
       switched.id = 'acc-model-notice';
-      switched.innerText = `평소 쓰는 모델이 혼잡하여 ${modelInfo.model} 모델로 변환했습니다. 결과가 평소와 조금 다를 수 있습니다.`;
+      switched.innerText = modelInfo.notice;
       contentArea.appendChild(switched);
     }
 
@@ -643,6 +643,7 @@
     renderOverlayContent(result.text, isSelection, result.truncatedFrom, {
       model: result.model,
       switchedForLoad: result.switchedForLoad,
+      notice: result.notice,
       promptLabel: result.promptLabel
     });
   }

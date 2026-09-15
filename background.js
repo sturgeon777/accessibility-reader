@@ -5,6 +5,8 @@ const MODEL_CANDIDATES = ['gemini-3.6-flash', 'gemini-2.5-flash'];
 // 목록에는 폐기된 구버전이 남아 있기도 하므로 여유 있게 훑는다.
 // 이 단계는 재시도 없이 한 번씩만 부르고, 전체 시간 제한이 따로 있어 안전하다.
 const MAX_DISCOVERED_TRIES = 5;
+// 없는 모델(404)로 확인되면 이 시간 동안만 건너뛴다. 그 뒤에는 다시 확인한다.
+const UNAVAILABLE_TTL_MS = 12 * 60 * 60 * 1000;
 const MAX_INPUT_CHARS = 8000;
 
 // 서버 혼잡/일시 장애. 재시도하면 대개 풀린다.
@@ -71,6 +73,9 @@ async function reinjectOpenTabs() {
 }
 
 chrome.runtime.onInstalled.addListener(async () => {
+  // 예전에는 성공한 모델을 저장해 다음부터 먼저 썼다. 그 방식은 한 번 대체 모델로
+  // 넘어가면 기본 모델이 살아나도 다시 시도하지 않아 제거했다. 남은 값을 지운다.
+  await chrome.storage.local.remove('geminiModel');
   await chrome.contextMenus.removeAll();
   chrome.contextMenus.create({
     id: "transformSelectionMenu",
@@ -194,13 +199,25 @@ async function callModelWithRetry(model, apiKey, prompt, deadline) {
   return last;
 }
 
-// 모델 이름이 틀렸을 때만 다음 후보로 넘어간다.
-// 인증 실패(401/403), 할당량 초과(429), 서버 오류(5xx)는 모델과 무관하므로 그대로 보고한다.
+// 모델이 없거나 폐기되었을 때만 '사용 불가'로 본다.
+// 인증 실패(401/403), 할당량 초과(429), 서버 오류(5xx)는 모델과 무관하다.
+// 예전에는 문구에 'not supported'만 있어도 모델 없음으로 보았는데, 그러면
+// "이 지역에서는 지원하지 않음" 같은 400 오류까지 모델 문제로 잘못 분류했다.
 function isModelNotFound(res, json) {
   if (res.status === 404) return true;
   const message = (json && json.error && json.error.message) || '';
   const status = (json && json.error && json.error.status) || '';
-  return status === 'NOT_FOUND' || /is not found|not supported|unsupported/i.test(message);
+  return status === 'NOT_FOUND' || /is not found|no longer available/i.test(message);
+}
+
+async function loadUnavailable() {
+  const { unavailableModels = {} } = await chrome.storage.local.get('unavailableModels');
+  const now = Date.now();
+  const fresh = {};
+  Object.keys(unavailableModels).forEach(name => {
+    if (now - unavailableModels[name] < UNAVAILABLE_TTL_MS) fresh[name] = unavailableModels[name];
+  });
+  return fresh;
 }
 
 async function listUsableModels(apiKey) {
@@ -271,14 +288,24 @@ function rankModel(name) {
   return score;
 }
 
-function pickExtraModels(discovered, alreadyTried, limit) {
+// 성능 등급. 낮을수록 먼저 시도한다.
+// 예전에는 버전만 먼저 보았는데, 'latest' 별칭을 가장 새 버전으로 치는 바람에
+// 성능이 낮은 flash-lite-latest가 gemini-2.5-pro보다 앞에 섰다.
+function modelTier(name) {
+  if (/gemma|learnlm/i.test(name)) return 3;
+  if (/preview|exp|thinking/i.test(name)) return 2;
+  if (/lite/i.test(name)) return 1;
+  return 0;
+}
+
+function pickExtraModels(discovered, exclude, limit) {
   return discovered
-    .filter(name => !alreadyTried.has(name))
-    .map(name => ({ name, score: rankModel(name), version: modelVersion(name) }))
+    .filter(name => !exclude.has(name))
+    .map(name => ({ name, score: rankModel(name), version: modelVersion(name), tier: modelTier(name) }))
     .filter(entry => entry.score !== null)
-    // 버전을 먼저 본다. 이름에 flash가 들어갔다는 이유로 폐기된 구버전이
-    // 앞자리를 차지하면, 정작 살아 있는 최신 모델까지 순서가 오지 않는다.
-    .sort((a, b) => (b.version - a.version) || (a.score - b.score))
+    // 등급을 먼저 보고, 같은 등급 안에서 버전을 본다. 버전을 보는 이유는 폐기된
+    // 구버전이 앞자리를 차지해 살아 있는 최신 모델까지 순서가 오지 않는 것을 막기 위해서다.
+    .sort((a, b) => (a.tier - b.tier) || (b.version - a.version) || (a.score - b.score))
     .slice(0, limit)
     .map(entry => entry.name);
 }
@@ -287,6 +314,12 @@ function pickExtraModels(discovered, alreadyTried, limit) {
 async function tryOneModel(model, apiKey, prompt, state, withRetry) {
   if (Date.now() > state.deadline) {
     state.timedOut = true;
+    return null;
+  }
+
+  if (state.unavailable[model]) {
+    state.skipped.push(model);
+    state.failures.push({ model, reason: '최근 사용할 수 없는 모델로 확인되어 건너뜀' });
     return null;
   }
 
@@ -301,8 +334,9 @@ async function tryOneModel(model, apiKey, prompt, state, withRetry) {
   if (isModelNotFound(res, json)) {
     const reason = apiMessage || `HTTP ${res.status}`;
     state.lastNotFound = reason;
-    // 저장해 둔 모델이 사라진 경우에만 캐시를 비운다.
-    if (model === state.cached) state.cachedModelMissing = true;
+    // 영구히 저장하지 않고 일정 시간만 건너뛴다. 모델은 다시 열리기도 한다.
+    state.unavailable[model] = Date.now();
+    state.unavailableChanged = true;
     state.failures.push({ model, reason: `사용 불가 - ${reason}` });
     console.warn(`[acc-reader] ${model} 사용 불가:`, reason);
     return null;
@@ -319,49 +353,67 @@ async function tryOneModel(model, apiKey, prompt, state, withRetry) {
   throw new Error(`API 오류 (HTTP ${res.status}): ${detail}`);
 }
 
-// 성공한 모델 id를 저장해 두었다가 다음 요청에서 먼저 시도한다.
+// 매번 기본 모델부터 시도한다.
+//
+// 예전에는 성공한 모델을 저장해 다음 요청에서 가장 먼저 썼다. 그런데 기본 모델이 한 번
+// 실패해 대체 모델(gemini-flash-lite-latest)로 넘어간 날 그 모델이 저장되자, 이후에는
+// 기본 모델이 멀쩡해져도 다시 시도하지 않고 성능이 낮은 대체 모델만 계속 썼다.
+// 그래서 '잘 된 모델'을 기억하지 않고 '안 되는 모델'을 12시간만 기억하도록 바꿨다.
 async function generate(prompt, apiKey, deadline) {
-  const cached = (await chrome.storage.local.get('geminiModel')).geminiModel;
-  const primary = cached
-    ? [cached, ...MODEL_CANDIDATES.filter(m => m !== cached)]
-    : [...MODEL_CANDIDATES];
-
   const state = {
     lastNotFound: null,
     lastTransient: null,
     switchedForLoad: false,
     timedOut: false,
-    cachedModelMissing: false,
     failures: [],
-    cached,
+    skipped: [],
+    unavailable: await loadUnavailable(),
+    unavailableChanged: false,
     deadline
   };
 
-  const finish = async (json, model) => {
-    // 쓸 수 있는 응답인지 먼저 확인한 뒤에 저장한다.
-    const text = extractText(json);
-    // 혼잡으로 넘어온 모델은 기본값으로 저장하지 않는다. 잠깐 붐빈 것뿐이므로.
-    if (!state.switchedForLoad && model !== cached) {
-      await chrome.storage.local.set({ geminiModel: model });
+  const saveUnavailable = async () => {
+    if (state.unavailableChanged) {
+      await chrome.storage.local.set({ unavailableModels: state.unavailable });
     }
-    console.log('[acc-reader] 사용 모델:', model);
-    return { text, model, switchedForLoad: state.switchedForLoad };
   };
 
-  for (const model of primary) {
+  const finish = async (json, model) => {
+    const text = extractText(json);
+    if (state.unavailable[model]) {
+      delete state.unavailable[model];
+      state.unavailableChanged = true;
+    }
+    await saveUnavailable();
+
+    // 기본 모델이 아닌 모델로 답했다면 이유와 함께 알린다. 조용히 바뀌지 않게.
+    const preferred = MODEL_CANDIDATES[0];
+    let notice = null;
+    if (model !== preferred) {
+      const why = state.failures
+        .map(f => `${f.model}: ${String(f.reason).slice(0, 80)}`)
+        .join(' / ');
+      notice = `기본 모델(${preferred}) 대신 ${model}로 변환했습니다. 결과가 평소와 다를 수 있습니다.`;
+      if (why) notice += ` (이유: ${why})`;
+    }
+
+    console.log('[acc-reader] 사용 모델:', model);
+    return { text, model, switchedForLoad: state.switchedForLoad, notice };
+  };
+
+  for (const model of MODEL_CANDIDATES) {
     const json = await tryOneModel(model, apiKey, prompt, state, true);
     if (json) return finish(json, model);
   }
 
-  // 모델은 시간이 지나면 폐기된다. 하드코딩한 후보가 모두 실패하면
+  // 모델은 시간이 지나면 폐기된다. 준비한 후보가 모두 실패하면
   // API에 실제 사용 가능한 목록을 물어보고 그중에서 이어서 시도한다.
   const discovered = await listUsableModels(apiKey);
-  const extra = pickExtraModels(discovered, new Set(primary), MAX_DISCOVERED_TRIES);
+  const exclude = new Set([...MODEL_CANDIDATES, ...Object.keys(state.unavailable)]);
+  const extra = pickExtraModels(discovered, exclude, MAX_DISCOVERED_TRIES);
 
   if (extra.length) {
     console.log('[acc-reader] 목록에서 추가 시도:', extra.join(', '));
-    // 여기서 switchedForLoad를 켜지 않는다. 폐기된 모델 때문에 넘어온 경우에는
-    // 새로 찾은 모델을 기본값으로 저장해야 다음 요청에서 헛걸음하지 않는다.
     for (const model of extra) {
       // 이미 시간을 많이 썼으므로 여기서는 재시도 없이 한 번씩만 빠르게 훑는다.
       const json = await tryOneModel(model, apiKey, prompt, state, false);
@@ -369,11 +421,12 @@ async function generate(prompt, apiKey, deadline) {
     }
   }
 
-  // 저장해 둔 모델이 실제로 사라졌을 때만 캐시를 비운다.
-  // 단순히 붐볐을 뿐인데 지우면 다음 요청이 또 처음부터 탐색하게 된다.
-  if (state.cachedModelMissing) {
-    await chrome.storage.local.remove('geminiModel');
-  }
+  // 모두 실패했다면, 이번에 기록 때문에 건너뛴 모델은 다음 요청에서 다시 확인하게 한다.
+  state.skipped.forEach(name => {
+    delete state.unavailable[name];
+    state.unavailableChanged = true;
+  });
+  await saveUnavailable();
 
   if (state.timedOut) {
     throw new Error(
@@ -438,6 +491,7 @@ async function handleTransform(sourceText) {
       truncatedFrom,
       model: result.model,
       switchedForLoad: result.switchedForLoad,
+      notice: result.notice,
       promptLabel: PROMPT_LABEL
     };
   } catch (err) {
