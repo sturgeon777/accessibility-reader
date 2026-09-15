@@ -465,7 +465,10 @@
     contentArea.innerHTML = '';
 
     const modelTag = document.getElementById('acc-model-tag');
-    if (modelTag) modelTag.innerText = modelInfo && modelInfo.model ? modelInfo.model : '';
+    if (modelTag) {
+      const parts = modelInfo ? [modelInfo.model, modelInfo.promptLabel] : [];
+      modelTag.innerText = parts.filter(Boolean).join(' · ');
+    }
 
     // 혼잡으로 다른 모델이 답한 경우, 조용히 바뀌지 않도록 알린다.
     if (modelInfo && modelInfo.switchedForLoad) {
@@ -639,7 +642,8 @@
 
     renderOverlayContent(result.text, isSelection, result.truncatedFrom, {
       model: result.model,
-      switchedForLoad: result.switchedForLoad
+      switchedForLoad: result.switchedForLoad,
+      promptLabel: result.promptLabel
     });
   }
 
