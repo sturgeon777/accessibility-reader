@@ -427,7 +427,14 @@ function modelVersion(name) {
 
 // 텍스트 변환에 쓸 수 없는 모델을 걸러내고 우선순위를 매긴다. 점수가 낮을수록 먼저 시도한다.
 function rankModel(name) {
-  if (/embedding|aqa|imagen|veo|tts|audio|image|vision|live/i.test(name)) return null;
+  // 글을 쓰는 일반 Gemini 모델만 고른다.
+  // 모델 목록에는 음성 받아쓰기(gemini-3.5-transcribe), 음악 생성(lyria-3.5),
+  // 음성 대화(gemini-omni-1.1-flash) 같은 전용 모델도 '글 생성 지원'으로 나온다.
+  // 예전에는 이름에 특정 단어가 있는 모델만 빼는 방식이라 새로 생긴 전용 모델을
+  // 걸러내지 못했고, 탐색 기회를 이런 모델에 써 버렸다. 그래서 고르는 방식으로 뒤집었다.
+  if (!/^gemini-/i.test(name)) return null;
+  if (!/flash|pro/i.test(name)) return null;
+  if (/embedding|aqa|imagen|veo|tts|audio|image|vision|live|transcribe|omni|robotics|computer-use/i.test(name)) return null;
   let score = 0;
   if (/flash/i.test(name)) score -= 30;
   else if (/pro/i.test(name)) score -= 10;
