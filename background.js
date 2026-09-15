@@ -1,8 +1,7 @@
 const API_BASE = 'https://generativelanguage.googleapis.com/v1beta';
 // 1순위 후보. 여기서 모두 실패하면 API에 실제 사용 가능한 목록을 물어본다.
-// 기본 모델은 3.5-flash. 3.6-flash는 무료 사용량이 금방 차서 시험 중 자주 한도(429)에 걸렸다.
-// 같은 모델로 프롬프트를 비교할 수 있도록 오늘 쓸 수 있는 모델을 앞에 둔다.
-const MODEL_CANDIDATES = ['gemini-3.5-flash', 'gemini-3.6-flash', 'gemini-2.5-flash'];
+// 기본 모델은 3.6-flash. 무료 사용량 한도에 걸리거나 붐비면 3.5-flash부터 차례로 넘어간다.
+const MODEL_CANDIDATES = ['gemini-3.6-flash', 'gemini-3.5-flash', 'gemini-2.5-flash'];
 // 목록에서 추가로 시도해 볼 모델 수. 너무 많으면 사용자가 오래 기다린다.
 // 목록에는 폐기된 구버전이 남아 있기도 하므로 여유 있게 훑는다.
 // 이 단계는 재시도 없이 한 번씩만 부르고, 전체 시간 제한이 따로 있어 안전하다.
