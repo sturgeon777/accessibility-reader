@@ -4,9 +4,13 @@ const MODEL_CANDIDATES = ['gemini-3.6-flash', 'gemini-2.5-flash'];
 // 목록에서 추가로 시도해 볼 모델 수. 너무 많으면 사용자가 오래 기다린다.
 // 목록에는 폐기된 구버전이 남아 있기도 하므로 여유 있게 훑는다.
 // 이 단계는 재시도 없이 한 번씩만 부르고, 전체 시간 제한이 따로 있어 안전하다.
-const MAX_DISCOVERED_TRIES = 5;
+const MAX_DISCOVERED_TRIES = 8;
 // 없는 모델(404)로 확인되면 이 시간 동안만 건너뛴다. 그 뒤에는 다시 확인한다.
 const UNAVAILABLE_TTL_MS = 12 * 60 * 60 * 1000;
+// 사용량 한도(429)에 걸린 모델을 건너뛰는 시간. 무료 등급의 한도는 모델마다 따로라서
+// 한 모델이 막혀도 다른 모델은 쓸 수 있다. 서버가 알려준 대기 시간이 있으면 그것을 따른다.
+const QUOTA_COOLDOWN_MS = 60 * 1000;
+const QUOTA_DAILY_COOLDOWN_MS = 60 * 60 * 1000;
 const MAX_INPUT_CHARS = 8000;
 
 // 서버 혼잡/일시 장애. 재시도하면 대개 풀린다.
@@ -232,6 +236,10 @@ async function callModel(model, apiKey, prompt, deadline) {
     buffer += decoder.decode();
     if (buffer) handleLine(buffer);
 
+    // 정상적으로 끝난 응답은 마지막 조각에 끝맺음 표시(finishReason)가 있다.
+    // 표시 없이 스트림이 닫혔다면 도중에 끊긴 것이므로 사용자에게 알린다.
+    if (text && !finishReason) finishReason = 'INCOMPLETE';
+
     // 한 번에 받은 응답과 같은 모양으로 합쳐서 돌려준다. extractText가 그대로 읽는다.
     const json = {
       candidates: (text || finishReason) ? [{ content: { parts: [{ text }] }, finishReason }] : [],
@@ -261,6 +269,8 @@ async function callModelWithRetry(model, apiKey, prompt, deadline) {
     }
     // 느려서 끊긴 모델은 다시 불러도 또 끊긴다. 재시도하지 않고 다음 모델로 넘긴다.
     if (last.json && last.json.timedOut) return last;
+    // 사용량 한도(429)는 잠깐 기다린다고 풀리지 않는다. 다시 부르면 사용량만 버린다.
+    if (last.res.status === 429) return last;
     if (attempt >= RETRY_DELAYS_MS.length) break;
     // 남은 시간이 없으면 대기 없이 곧바로 다시 부르지 말고 여기서 끝낸다.
     // 간격 없는 재호출은 특히 429(할당량)에서 상황을 악화시킨다.
@@ -281,6 +291,36 @@ function isModelNotFound(res, json) {
   const message = (json && json.error && json.error.message) || '';
   const status = (json && json.error && json.error.status) || '';
   return status === 'NOT_FOUND' || /is not found|no longer available/i.test(message);
+}
+
+// 429 응답에서 한도 종류와 대기 시간을 읽는다.
+// 예: details[].quotaId = 'GenerateRequestsPerDayPerProjectPerModel-FreeTier',
+//     details[].retryDelay = '43s'
+function quotaCooldownMs(json) {
+  const details = (json && json.error && json.error.details) || [];
+  let retryMs = 0;
+  let daily = false;
+  details.forEach(d => {
+    if (typeof d.retryDelay === 'string') {
+      const sec = parseFloat(d.retryDelay);
+      if (!isNaN(sec)) retryMs = Math.max(retryMs, sec * 1000);
+    }
+    (d.violations || []).forEach(v => {
+      if (/PerDay/i.test(v.quotaId || '')) daily = true;
+    });
+  });
+  if (daily) return Math.max(retryMs, QUOTA_DAILY_COOLDOWN_MS);
+  return retryMs || QUOTA_COOLDOWN_MS;
+}
+
+async function loadCooldowns() {
+  const { quotaCooldowns = {} } = await chrome.storage.local.get('quotaCooldowns');
+  const now = Date.now();
+  const fresh = {};
+  Object.keys(quotaCooldowns).forEach(name => {
+    if (quotaCooldowns[name] > now) fresh[name] = quotaCooldowns[name];
+  });
+  return fresh;
 }
 
 async function loadUnavailable() {
@@ -336,6 +376,9 @@ function extractText(json) {
     throw new Error('AI가 빈 응답을 반환했습니다. 잠시 후 다시 시도해 주세요.');
   }
 
+  if (candidate.finishReason === 'INCOMPLETE') {
+    return `${text}\n\n(안내: 응답이 도중에 끊겨 뒷부분이 빠졌을 수 있습니다. 다시 변환해 주세요.)`;
+  }
   if (candidate.finishReason === 'MAX_TOKENS') {
     return `${text}\n\n(안내: 응답이 길이 제한에 걸려 도중에 끊겼습니다.)`;
   }
@@ -384,6 +427,8 @@ function pickExtraModels(discovered, exclude, limit) {
 }
 
 // 성공하면 응답을, 실패하면 null을 돌려주고 실패 사유를 state에 남긴다.
+// 성공하면 응답을, 실패하면 null을 돌려주고 실패 사유를 state에 남긴다.
+// 사유는 결과 창 안내에 그대로 들어가므로 짧게 적고, 자세한 내용은 콘솔에 남긴다.
 async function tryOneModel(model, apiKey, prompt, state, withRetry) {
   if (Date.now() > state.deadline) {
     state.timedOut = true;
@@ -392,7 +437,15 @@ async function tryOneModel(model, apiKey, prompt, state, withRetry) {
 
   if (state.unavailable[model]) {
     state.skipped.push(model);
-    state.failures.push({ model, reason: '최근 사용할 수 없는 모델로 확인되어 건너뜀' });
+    state.failures.push({ model, reason: '최근 사용 불가로 건너뜀' });
+    return null;
+  }
+
+  if (state.cooldowns[model] > Date.now()) {
+    const minutes = Math.ceil((state.cooldowns[model] - Date.now()) / 60000);
+    state.failures.push({ model, reason: `사용량 한도로 건너뜀(${minutes}분 뒤 다시 시도)` });
+    state.lastTransient = 'HTTP 429';
+    state.switchedForLoad = true;
     return null;
   }
 
@@ -405,23 +458,36 @@ async function tryOneModel(model, apiKey, prompt, state, withRetry) {
   const apiMessage = (json && json.error && json.error.message) || '';
 
   if (isModelNotFound(res, json)) {
-    const reason = apiMessage || `HTTP ${res.status}`;
-    state.lastNotFound = reason;
+    state.lastNotFound = apiMessage || `HTTP ${res.status}`;
     // 영구히 저장하지 않고 일정 시간만 건너뛴다. 모델은 다시 열리기도 한다.
     state.unavailable[model] = Date.now();
     state.unavailableChanged = true;
-    state.failures.push({ model, reason: `사용 불가 - ${reason}` });
-    console.warn(`[acc-reader] ${model} 사용 불가:`, reason);
+    state.failures.push({ model, reason: `사용 불가(${res.status})` });
+    console.warn(`[acc-reader] ${model} 사용 불가:`, apiMessage);
     return null;
   }
+
   if (TRANSIENT_STATUS.includes(res.status)) {
-    const reason = `HTTP ${res.status}${apiMessage ? ' - ' + apiMessage : ''}`;
+    let reason;
+    if (json && json.timedOut) {
+      reason = '응답 시간 초과';
+    } else if (res.status === 429) {
+      reason = '사용량 한도 초과(429)';
+      // 다음 요청에서도 곧바로 건너뛰도록 기억한다.
+      state.cooldowns[model] = Date.now() + quotaCooldownMs(json);
+      state.cooldownsChanged = true;
+    } else if (res.status === 503) {
+      reason = '서버 혼잡(503)';
+    } else {
+      reason = `서버 오류(${res.status})`;
+    }
     state.lastTransient = `HTTP ${res.status}`;
     state.switchedForLoad = true;
     state.failures.push({ model, reason });
-    console.warn(`[acc-reader] ${model} 일시적 실패:`, reason);
+    console.warn(`[acc-reader] ${model} ${reason}:`, apiMessage);
     return null;
   }
+
   const detail = (json.error && json.error.message) || '(응답 본문 없음)';
   throw new Error(`API 오류 (HTTP ${res.status}): ${detail}`);
 }
@@ -442,12 +508,17 @@ async function generate(prompt, apiKey, deadline) {
     skipped: [],
     unavailable: await loadUnavailable(),
     unavailableChanged: false,
+    cooldowns: await loadCooldowns(),
+    cooldownsChanged: false,
     deadline
   };
 
   const saveUnavailable = async () => {
     if (state.unavailableChanged) {
       await chrome.storage.local.set({ unavailableModels: state.unavailable });
+    }
+    if (state.cooldownsChanged) {
+      await chrome.storage.local.set({ quotaCooldowns: state.cooldowns });
     }
   };
 
@@ -464,10 +535,10 @@ async function generate(prompt, apiKey, deadline) {
     let notice = null;
     if (model !== preferred) {
       const why = state.failures
-        .map(f => `${f.model}: ${String(f.reason).slice(0, 80)}`)
-        .join(' / ');
+        .map(f => `${f.model} ${f.reason}`)
+        .join(', ');
       notice = `기본 모델(${preferred}) 대신 ${model}로 변환했습니다. 결과가 평소와 다를 수 있습니다.`;
-      if (why) notice += ` (이유: ${why})`;
+      if (why) notice += ` (${why})`;
     }
 
     console.log('[acc-reader] 사용 모델:', model);
@@ -482,7 +553,8 @@ async function generate(prompt, apiKey, deadline) {
   // 모델은 시간이 지나면 폐기된다. 준비한 후보가 모두 실패하면
   // API에 실제 사용 가능한 목록을 물어보고 그중에서 이어서 시도한다.
   const discovered = await listUsableModels(apiKey);
-  const exclude = new Set([...MODEL_CANDIDATES, ...Object.keys(state.unavailable)]);
+  const cooling = Object.keys(state.cooldowns).filter(name => state.cooldowns[name] > Date.now());
+  const exclude = new Set([...MODEL_CANDIDATES, ...Object.keys(state.unavailable), ...cooling]);
   const extra = pickExtraModels(discovered, exclude, MAX_DISCOVERED_TRIES);
 
   if (extra.length) {
